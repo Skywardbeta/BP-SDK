@@ -93,7 +93,6 @@ static int encode_primary(cbor_encoder_t *enc, const bp_primary_t *p) {
     encode_eid(enc, p->source_scheme, (uint64_t *)p->source_ssp, p->source_uri);
     encode_eid(enc, p->report_scheme, (uint64_t *)p->report_ssp, p->report_uri);
 
-    /* Creation timestamp [time, seq] */
     cbor_encode_array(enc, 2);
     cbor_encode_uint(enc, p->creation_ts);
     cbor_encode_uint(enc, p->creation_seq);
@@ -125,7 +124,6 @@ static int encode_primary(cbor_encoder_t *enc, const bp_primary_t *p) {
     return enc->error ? -1 : 0;
 }
 
-/* Encode Canonical Block */
 static int encode_block(cbor_encoder_t *enc, const bp_block_t *b) {
     size_t arr_len = (b->crc_type != BP_CRC_NONE) ? 6 : 5;
     size_t start = enc->len;
@@ -162,10 +160,8 @@ int bp_bundle_encode(const bp_bundle_full_t *bundle, uint8_t *out, size_t cap) {
     cbor_encoder_t enc;
     cbor_encoder_init(&enc, out, cap);
 
-    /* Bundle is indefinite-length array */
     cbor_encode_indef_array_start(&enc);
 
-    /* Primary block */
     if (encode_primary(&enc, &bundle->primary) < 0) return -1;
 
     /* Extension blocks */
@@ -231,10 +227,8 @@ int bp_bundle_decode(const uint8_t *data, size_t len, bp_bundle_full_t *bundle) 
     cbor_decoder_t dec;
     cbor_decoder_init(&dec, data, len);
 
-    /* Bundle is indefinite-length array */
     if (cbor_decode_indef_array_start(&dec) < 0) return -1;
 
-    /* Primary block */
     size_t prim_len;
     if (cbor_decode_array(&dec, &prim_len) < 0) return -1;
 
@@ -263,7 +257,6 @@ int bp_bundle_decode(const uint8_t *data, size_t len, bp_bundle_full_t *bundle) 
         if (cbor_decode_uint(&dec, &bundle->primary.total_adu_len) < 0) return -1;
     }
 
-    /* Skip CRC if present */
     if (bundle->primary.crc_type != BP_CRC_NONE) {
         cbor_skip(&dec);
     }

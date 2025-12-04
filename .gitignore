@@ -1,1 +1,19 @@
 /.agent
+
+# Build outputs
+c/build/
+*.o
+*.a
+*.exe
+*.lib
+*.dll
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
