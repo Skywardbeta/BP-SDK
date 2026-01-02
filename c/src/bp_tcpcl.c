@@ -1,5 +1,5 @@
-/* bp_tcpcl.c - TCPCLv4 (RFC 9174) */
 #include "bp_tcpcl.h"
+#include "bp_utils.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -15,30 +15,34 @@
 
 static const uint8_t TCPCL_MAGIC[4] = {'d', 't', 'n', '!'};
 #define TCPCL_VERSION 4
+#define TCPCL_MAX_NODE_ID_LEN 256
+#define TCPCL_MAX_SEGMENT_SIZE (16 * 1024 * 1024)
+#define TCPCL_MAX_TRANSFER_SIZE (64 * 1024 * 1024)
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
+    if (fd < 0 || !buf) return -1;
     size_t sent = 0;
     while (sent < len) {
         ssize_t n = send(fd, (const char*)(buf + sent), (int)(len - sent), 0);
         if (n <= 0) return -1;
-        sent += n;
+        sent += (size_t)n;
     }
     return 0;
 }
 
 static int read_all(int fd, uint8_t *buf, size_t len) {
+    if (fd < 0 || !buf) return -1;
     size_t got = 0;
     while (got < len) {
         ssize_t n = recv(fd, (char*)(buf + got), (int)(len - got), 0);
         if (n <= 0) return -1;
-        got += n;
+        got += (size_t)n;
     }
     return 0;
 }
 
-static int encode_uint64(uint8_t *buf, uint64_t val) {
-    for (int i = 7; i >= 0; i--) buf[7 - i] = (val >> (i * 8)) & 0xFF;
-    return 8;
+static void encode_uint64(uint8_t *buf, uint64_t val) {
+    for (int i = 7; i >= 0; i--) buf[7 - i] = (uint8_t)((val >> (i * 8)) & 0xFF);
 }
 
 static uint64_t decode_uint64(const uint8_t *buf) {
@@ -48,13 +52,16 @@ static uint64_t decode_uint64(const uint8_t *buf) {
 }
 
 int tcpcl_send_contact_header(int fd) {
+    if (fd < 0) return -1;
     uint8_t hdr[6];
     memcpy(hdr, TCPCL_MAGIC, 4);
-    hdr[4] = TCPCL_VERSION; hdr[5] = 0;
+    hdr[4] = TCPCL_VERSION;
+    hdr[5] = 0;
     return write_all(fd, hdr, 6);
 }
 
 int tcpcl_recv_contact_header(int fd) {
+    if (fd < 0) return -1;
     uint8_t hdr[6];
     if (read_all(fd, hdr, 6) < 0) return -1;
     if (memcmp(hdr, TCPCL_MAGIC, 4) != 0) return -1;
@@ -63,19 +70,23 @@ int tcpcl_recv_contact_header(int fd) {
 }
 
 int tcpcl_send_sess_init(tcpcl_session_t *sess) {
+    if (!sess || sess->fd < 0) return -1;
+    
     uint8_t msg[64];
     size_t pos = 0;
 
     msg[pos++] = TCPCL_MSG_SESS_INIT;
-    msg[pos++] = (sess->keepalive_interval >> 8) & 0xFF;
-    msg[pos++] = sess->keepalive_interval & 0xFF;
-    pos += encode_uint64(msg + pos, sess->segment_mru);
-    pos += encode_uint64(msg + pos, sess->transfer_mru);
+    msg[pos++] = (uint8_t)((sess->keepalive_interval >> 8) & 0xFF);
+    msg[pos++] = (uint8_t)(sess->keepalive_interval & 0xFF);
+    encode_uint64(msg + pos, sess->segment_mru);
+    pos += 8;
+    encode_uint64(msg + pos, sess->transfer_mru);
+    pos += 8;
 
     const char *node_id = "ipn:0.0";
     uint16_t nid_len = (uint16_t)strlen(node_id);
-    msg[pos++] = (nid_len >> 8) & 0xFF;
-    msg[pos++] = nid_len & 0xFF;
+    msg[pos++] = (uint8_t)((nid_len >> 8) & 0xFF);
+    msg[pos++] = (uint8_t)(nid_len & 0xFF);
     memcpy(msg + pos, node_id, nid_len);
     pos += nid_len;
     msg[pos++] = 0; msg[pos++] = 0; msg[pos++] = 0; msg[pos++] = 0;
@@ -84,26 +95,42 @@ int tcpcl_send_sess_init(tcpcl_session_t *sess) {
 }
 
 int tcpcl_recv_sess_init(tcpcl_session_t *sess) {
+    if (!sess || sess->fd < 0) return -1;
+    
     uint8_t hdr[32];
     if (read_all(sess->fd, hdr, 1) < 0) return -1;
     if (hdr[0] != TCPCL_MSG_SESS_INIT) return -1;
 
     if (read_all(sess->fd, hdr, 2) < 0) return -1;
-    uint16_t peer_keepalive = (hdr[0] << 8) | hdr[1];
+    uint16_t peer_keepalive = (uint16_t)((hdr[0] << 8) | hdr[1]);
     if (peer_keepalive > 0 && peer_keepalive < sess->keepalive_interval)
         sess->keepalive_interval = peer_keepalive;
 
     if (read_all(sess->fd, hdr, 16) < 0) return -1;
     uint64_t peer_seg_mru = decode_uint64(hdr);
     uint64_t peer_xfer_mru = decode_uint64(hdr + 8);
+    
+    if (peer_seg_mru > TCPCL_MAX_SEGMENT_SIZE) peer_seg_mru = TCPCL_MAX_SEGMENT_SIZE;
+    if (peer_xfer_mru > TCPCL_MAX_TRANSFER_SIZE) peer_xfer_mru = TCPCL_MAX_TRANSFER_SIZE;
+    
     if (peer_seg_mru < sess->segment_mru) sess->segment_mru = peer_seg_mru;
     if (peer_xfer_mru < sess->transfer_mru) sess->transfer_mru = peer_xfer_mru;
 
     if (read_all(sess->fd, hdr, 2) < 0) return -1;
-    uint16_t nid_len = (hdr[0] << 8) | hdr[1];
-    uint8_t *nid = malloc(nid_len);
-    if (read_all(sess->fd, nid, nid_len) < 0) { free(nid); return -1; }
-    free(nid);
+    uint16_t nid_len = (uint16_t)((hdr[0] << 8) | hdr[1]);
+    
+    if (nid_len > TCPCL_MAX_NODE_ID_LEN) return -1;
+    
+    if (nid_len > 0) {
+        uint8_t *nid = bp_alloc(nid_len);
+        if (!nid) return -1;
+        if (read_all(sess->fd, nid, nid_len) < 0) { 
+            bp_free(nid); 
+            return -1; 
+        }
+        bp_free(nid);
+    }
+    
     if (read_all(sess->fd, hdr, 4) < 0) return -1;
 
     sess->connected = 1;
@@ -111,7 +138,9 @@ int tcpcl_recv_sess_init(tcpcl_session_t *sess) {
 }
 
 int tcpcl_send_bundle(tcpcl_session_t *sess, const uint8_t *data, size_t len) {
-    if (!sess->connected) return -1;
+    if (!sess || !sess->connected || sess->fd < 0) return -1;
+    if (len > 0 && !data) return -1;
+    if (len > sess->transfer_mru) return -1;
 
     uint64_t transfer_id = sess->next_transfer_id++;
     size_t offset = 0;
@@ -142,25 +171,44 @@ int tcpcl_send_bundle(tcpcl_session_t *sess, const uint8_t *data, size_t len) {
 }
 
 int tcpcl_recv_bundle(tcpcl_session_t *sess, uint8_t **data, size_t *len) {
-    if (!sess->connected) return -1;
+    if (!sess || !sess->connected || sess->fd < 0) return -1;
+    if (!data || !len) return -1;
+    
+    *data = NULL;
+    *len = 0;
 
     uint8_t *buf = NULL;
     size_t buf_len = 0;
+    size_t buf_cap = 0;
     uint64_t transfer_id = 0;
     int done = 0;
 
     while (!done) {
         uint8_t hdr[18];
-        if (read_all(sess->fd, hdr, 18) < 0) { free(buf); return -1; }
-        if (hdr[0] != TCPCL_MSG_XFER_SEG) { free(buf); return -1; }
+        if (read_all(sess->fd, hdr, 18) < 0) goto fail;
+        if (hdr[0] != TCPCL_MSG_XFER_SEG) goto fail;
 
         uint8_t flags = hdr[1];
         transfer_id = decode_uint64(hdr + 2);
         uint64_t seg_len = decode_uint64(hdr + 10);
 
-        buf = realloc(buf, buf_len + seg_len);
-        if (read_all(sess->fd, buf + buf_len, seg_len) < 0) { free(buf); return -1; }
+        if (seg_len > sess->segment_mru) goto fail;
+        if (buf_len + seg_len > sess->transfer_mru) goto fail;
+
+        if (buf_len + seg_len > buf_cap) {
+            size_t new_cap = buf_cap ? buf_cap * 2 : 4096;
+            while (new_cap < buf_len + seg_len) new_cap *= 2;
+            if (new_cap > sess->transfer_mru) new_cap = sess->transfer_mru;
+            
+            uint8_t *new_buf = bp_realloc(buf, new_cap);
+            if (!new_buf) goto fail;
+            buf = new_buf;
+            buf_cap = new_cap;
+        }
+
+        if (read_all(sess->fd, buf + buf_len, seg_len) < 0) goto fail;
         buf_len += seg_len;
+        
         if (flags & TCPCL_SEG_END) done = 1;
     }
 
@@ -169,13 +217,19 @@ int tcpcl_recv_bundle(tcpcl_session_t *sess, uint8_t **data, size_t *len) {
     ack[1] = TCPCL_SEG_END;
     encode_uint64(ack + 2, transfer_id);
     encode_uint64(ack + 10, buf_len);
-    write_all(sess->fd, ack, 18);
+    if (write_all(sess->fd, ack, 18) < 0) goto fail;
 
-    *data = buf; *len = buf_len;
+    *data = buf;
+    *len = buf_len;
     return 0;
+
+fail:
+    bp_free(buf);
+    return -1;
 }
 
 int tcpcl_session_init(tcpcl_session_t *sess, int fd) {
+    if (!sess) return -1;
     memset(sess, 0, sizeof(*sess));
     sess->fd = fd;
     sess->keepalive_interval = 30;
@@ -186,21 +240,25 @@ int tcpcl_session_init(tcpcl_session_t *sess, int fd) {
 }
 
 int tcpcl_session_close(tcpcl_session_t *sess) {
-    if (sess->connected) {
+    if (!sess) return -1;
+    if (sess->connected && sess->fd >= 0) {
         uint8_t term[3] = { TCPCL_MSG_SESS_TERM, 0, 0 };
         write_all(sess->fd, term, 3);
     }
+    if (sess->fd >= 0) {
 #ifdef _WIN32
-    closesocket(sess->fd);
+        closesocket(sess->fd);
 #else
-    close(sess->fd);
+        close(sess->fd);
 #endif
+    }
     sess->fd = -1;
     sess->connected = 0;
     return 0;
 }
 
 int tcpcl_send_keepalive(tcpcl_session_t *sess) {
+    if (!sess || sess->fd < 0) return -1;
     uint8_t ka = TCPCL_MSG_KEEPALIVE;
     return write_all(sess->fd, &ka, 1);
 }
