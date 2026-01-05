@@ -29,6 +29,7 @@ void bp_fragment_ctx_init(bp_fragment_ctx_t *ctx);
 void bp_fragment_ctx_free(bp_fragment_ctx_t *ctx);
 int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag,
                     bp_bundle_full_t *complete);
+
 void bp_fragment_free_array(bp_bundle_full_t *frags, size_t count);
 
 #endif

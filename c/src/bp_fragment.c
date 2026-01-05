@@ -1,3 +1,4 @@
+/* bp_fragment.c - Bundle Fragmentation/Reassembly */
 #include "bp_fragment.h"
 #include "bp_utils.h"
 #include <string.h>
@@ -26,18 +27,19 @@ fail:
     bp_free(dst->dest_uri);
     bp_free(dst->source_uri);
     bp_free(dst->report_uri);
-    dst->dest_uri = dst->source_uri = dst->report_uri = NULL;
+    dst->dest_uri = NULL;
+    dst->source_uri = NULL;
+    dst->report_uri = NULL;
     return -1;
 }
 
 int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
                        bp_bundle_full_t **frags, size_t *count) {
-    if (!original || !frags || !count) return -1;
-    if (max_size < 100) return -1;
+    if (!original || !frags || !count || max_size < 100) return -1;
     
     *frags = NULL;
     *count = 0;
-
+    
     if (original->payload_len <= max_size) {
         bp_bundle_full_t *f = bp_alloc(sizeof(bp_bundle_full_t));
         if (!f) return -1;
@@ -60,8 +62,6 @@ int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
             memcpy(f->payload, original->payload, original->payload_len);
         }
         f->payload_len = original->payload_len;
-        f->blocks = NULL;
-        f->block_count = 0;
         
         *frags = f;
         *count = 1;
@@ -69,23 +69,17 @@ int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
     }
 
     size_t n = (original->payload_len + max_size - 1) / max_size;
-    bp_bundle_full_t *frag_array = bp_alloc(n * sizeof(bp_bundle_full_t));
-    if (!frag_array) return -1;
-    memset(frag_array, 0, n * sizeof(bp_bundle_full_t));
+    bp_bundle_full_t *arr = bp_alloc(n * sizeof(bp_bundle_full_t));
+    if (!arr) return -1;
+    memset(arr, 0, n * sizeof(bp_bundle_full_t));
 
     for (size_t i = 0; i < n; i++) {
         size_t offset = i * max_size;
         size_t len = (i == n - 1) ? (original->payload_len - offset) : max_size;
 
-        bp_bundle_full_t *f = &frag_array[i];
+        bp_bundle_full_t *f = &arr[i];
         if (copy_primary(&f->primary, &original->primary) < 0) {
-            for (size_t j = 0; j < i; j++) {
-                bp_free(frag_array[j].primary.dest_uri);
-                bp_free(frag_array[j].primary.source_uri);
-                bp_free(frag_array[j].primary.report_uri);
-                bp_free(frag_array[j].payload);
-            }
-            bp_free(frag_array);
+            bp_fragment_free_array(arr, i);
             return -1;
         }
         
@@ -98,13 +92,7 @@ int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
             bp_free(f->primary.dest_uri);
             bp_free(f->primary.source_uri);
             bp_free(f->primary.report_uri);
-            for (size_t j = 0; j < i; j++) {
-                bp_free(frag_array[j].primary.dest_uri);
-                bp_free(frag_array[j].primary.source_uri);
-                bp_free(frag_array[j].primary.report_uri);
-                bp_free(frag_array[j].payload);
-            }
-            bp_free(frag_array);
+            bp_fragment_free_array(arr, i);
             return -1;
         }
         memcpy(f->payload, original->payload + offset, len);
@@ -113,17 +101,26 @@ int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
         f->block_count = 0;
     }
     
-    *frags = frag_array;
+    *frags = arr;
     *count = n;
     return 0;
 }
 
-void bp_fragment_ctx_init(bp_fragment_ctx_t *ctx) {
-    if (ctx) memset(ctx, 0, sizeof(*ctx));
+void bp_fragment_free_array(bp_bundle_full_t *frags, size_t count) {
+    if (!frags) return;
+    for (size_t i = 0; i < count; i++) {
+        bp_free(frags[i].primary.dest_uri);
+        bp_free(frags[i].primary.source_uri);
+        bp_free(frags[i].primary.report_uri);
+        bp_free(frags[i].payload);
+        bp_free(frags[i].blocks);
+    }
+    bp_free(frags);
 }
 
+void bp_fragment_ctx_init(bp_fragment_ctx_t *ctx) { memset(ctx, 0, sizeof(*ctx)); }
+
 void bp_fragment_ctx_free(bp_fragment_ctx_t *ctx) {
-    if (!ctx) return;
     for (size_t i = 0; i < ctx->count; i++) {
         bp_free(ctx->entries[i].source_eid);
         bp_free(ctx->entries[i].assembled);
@@ -136,9 +133,7 @@ void bp_fragment_ctx_free(bp_fragment_ctx_t *ctx) {
 static bp_fragment_entry_t *find_entry(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag) {
     for (size_t i = 0; i < ctx->count; i++) {
         bp_fragment_entry_t *e = &ctx->entries[i];
-        if (e->creation_ts == frag->primary.creation_ts && 
-            e->creation_seq == frag->primary.creation_seq &&
-            e->total_len == frag->primary.total_adu_len)
+        if (e->creation_ts == frag->primary.creation_ts && e->creation_seq == frag->primary.creation_seq)
             return e;
     }
     return NULL;
@@ -147,17 +142,15 @@ static bp_fragment_entry_t *find_entry(bp_fragment_ctx_t *ctx, const bp_bundle_f
 int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bundle_full_t *complete) {
     if (!ctx || !frag || !complete) return -1;
     
-    memset(complete, 0, sizeof(*complete));
-
     if (!(frag->primary.flags & BP_FLAG_FRAGMENT)) {
+        memset(complete, 0, sizeof(*complete));
         if (copy_primary(&complete->primary, &frag->primary) < 0) return -1;
-        if (frag->payload_len > 0) {
+        if (frag->payload_len > 0 && frag->payload) {
             complete->payload = bp_alloc(frag->payload_len);
             if (!complete->payload) {
                 bp_free(complete->primary.dest_uri);
                 bp_free(complete->primary.source_uri);
                 bp_free(complete->primary.report_uri);
-                memset(complete, 0, sizeof(*complete));
                 return -1;
             }
             memcpy(complete->payload, frag->payload, frag->payload_len);
@@ -167,18 +160,23 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
     }
 
     if (frag->primary.total_adu_len == 0) return -1;
-    if (frag->primary.fragment_offset >= frag->primary.total_adu_len) return -1;
-    if (frag->primary.fragment_offset + frag->payload_len > frag->primary.total_adu_len) return -1;
+    
+    size_t off = frag->primary.fragment_offset;
+    size_t len = frag->payload_len;
+    
+    if (off + len > frag->primary.total_adu_len) return -1;
 
     bp_fragment_entry_t *e = find_entry(ctx, frag);
     if (!e) {
         if (ctx->count >= ctx->capacity) {
             size_t new_cap = ctx->capacity ? ctx->capacity * 2 : 4;
-            bp_fragment_entry_t *new_entries = bp_realloc(ctx->entries, new_cap * sizeof(bp_fragment_entry_t));
+            bp_fragment_entry_t *new_entries = bp_realloc(ctx->entries, 
+                                                           new_cap * sizeof(bp_fragment_entry_t));
             if (!new_entries) return -1;
             ctx->entries = new_entries;
             ctx->capacity = new_cap;
         }
+        
         e = &ctx->entries[ctx->count];
         memset(e, 0, sizeof(*e));
         e->creation_ts = frag->primary.creation_ts;
@@ -187,6 +185,7 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
         
         e->assembled = bp_alloc(e->total_len);
         if (!e->assembled) return -1;
+        memset(e->assembled, 0, e->total_len);
         
         size_t bitmap_size = (e->total_len + 7) / 8;
         e->bitmap = bp_alloc(bitmap_size);
@@ -195,24 +194,30 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
             e->assembled = NULL;
             return -1;
         }
-        memset(e->assembled, 0, e->total_len);
         memset(e->bitmap, 0, bitmap_size);
+        e->assembled_len = 0;
+        
         ctx->count++;
     }
 
-    size_t off = frag->primary.fragment_offset;
-    size_t len = frag->payload_len;
-    memcpy(e->assembled + off, frag->payload, len);
-
-    for (size_t i = off; i < off + len; i++)
-        e->bitmap[i / 8] |= (uint8_t)(1 << (i % 8));
+    if (frag->payload && len > 0) {
+        memcpy(e->assembled + off, frag->payload, len);
+        
+        for (size_t i = off; i < off + len; i++) {
+            e->bitmap[i / 8] |= (uint8_t)(1 << (i % 8));
+        }
+    }
 
     int complete_flag = 1;
-    for (size_t i = 0; i < e->total_len && complete_flag; i++) {
-        if (!(e->bitmap[i / 8] & (1 << (i % 8)))) complete_flag = 0;
+    for (size_t i = 0; i < e->total_len; i++) {
+        if (!(e->bitmap[i / 8] & (1 << (i % 8)))) {
+            complete_flag = 0;
+            break;
+        }
     }
 
     if (complete_flag) {
+        memset(complete, 0, sizeof(*complete));
         if (copy_primary(&complete->primary, &frag->primary) < 0) {
             return -1;
         }
@@ -225,19 +230,4 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
         return 1;
     }
     return 0;
-}
-
-void bp_fragment_free_array(bp_bundle_full_t *frags, size_t count) {
-    if (!frags) return;
-    for (size_t i = 0; i < count; i++) {
-        bp_free(frags[i].primary.dest_uri);
-        bp_free(frags[i].primary.source_uri);
-        bp_free(frags[i].primary.report_uri);
-        bp_free(frags[i].payload);
-        for (size_t j = 0; j < frags[i].block_count; j++) {
-            bp_free(frags[i].blocks[j].data);
-        }
-        bp_free(frags[i].blocks);
-    }
-    bp_free(frags);
 }
