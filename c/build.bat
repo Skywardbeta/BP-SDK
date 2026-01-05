@@ -61,7 +61,31 @@ ar rcs build/libbp_sdk.a build/bp_sdk.o build/bp_utils.o build/bp_cbor.o build/b
 if %errorlevel% neq 0 goto :error
 
 echo.
+echo === Building Tests ===
+
+if exist tests (
+    echo Building test_phase1...
+    gcc -I./include -Wall -Wextra -std=c11 tests/test_phase1.c -L./build -lbp_sdk -lws2_32 -o build/test_phase1.exe
+    if %errorlevel% neq 0 echo Warning: test_phase1 build failed
+
+    echo Building test_concurrency...
+    gcc -I./include -Wall -Wextra -std=c11 tests/test_concurrency.c -L./build -lbp_sdk -lws2_32 -o build/test_concurrency.exe
+    if %errorlevel% neq 0 echo Warning: test_concurrency build failed
+
+    if exist examples\test_bpsec.c (
+        echo Building test_bpsec...
+        gcc -I./include -Wall -Wextra -std=c11 examples/test_bpsec.c -L./build -lbp_sdk -lws2_32 -o build/test_bpsec.exe
+        if %errorlevel% neq 0 echo Warning: test_bpsec build failed
+    )
+)
+
+echo.
 echo === Build successful: build/libbp_sdk.a ===
+echo.
+echo To run tests:
+echo   build\test_phase1.exe
+echo   build\test_concurrency.exe
+echo   build\test_bpsec.exe
 exit /b 0
 
 :error
