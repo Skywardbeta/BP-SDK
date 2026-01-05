@@ -424,6 +424,121 @@ TEST(multiple_concurrent_streams) {
     #undef NUM_STREAMS
 }
 
+TEST(fragment_loss_timeout) {
+    bp_fragment_ctx_t ctx;
+    bp_fragment_ctx_init_with_timeout(&ctx, 50);
+    
+    bp_bundle_full_t frag1, frag2;
+    memset(&frag1, 0, sizeof(frag1));
+    memset(&frag2, 0, sizeof(frag2));
+    
+    frag1.primary.version = 7;
+    frag1.primary.flags = BP_FLAG_FRAGMENT;
+    frag1.primary.creation_ts = 9000;
+    frag1.primary.creation_seq = 1;
+    frag1.primary.total_adu_len = 300;
+    frag1.primary.fragment_offset = 0;
+    frag1.primary.lifetime_ms = 50;
+    
+    uint8_t data1[100];
+    memset(data1, 'A', sizeof(data1));
+    frag1.payload = data1;
+    frag1.payload_len = 100;
+    
+    bp_bundle_full_t complete;
+    int rc = bp_fragment_add(&ctx, &frag1, &complete);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(bp_fragment_pending_count(&ctx), 1);
+    
+    frag2.primary.version = 7;
+    frag2.primary.flags = BP_FLAG_FRAGMENT;
+    frag2.primary.creation_ts = 9000;
+    frag2.primary.creation_seq = 1;
+    frag2.primary.total_adu_len = 300;
+    frag2.primary.fragment_offset = 100;
+    frag2.primary.lifetime_ms = 50;
+    
+    uint8_t data2[100];
+    memset(data2, 'B', sizeof(data2));
+    frag2.payload = data2;
+    frag2.payload_len = 100;
+    
+    rc = bp_fragment_add(&ctx, &frag2, &complete);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(bp_fragment_pending_count(&ctx), 1);
+    
+    uint64_t now = (uint64_t)time(NULL) * 1000;
+    size_t expired = bp_fragment_expire(&ctx, now + 100);
+    ASSERT_EQ(expired, 1);
+    ASSERT_EQ(bp_fragment_pending_count(&ctx), 0);
+    
+    bp_fragment_ctx_free(&ctx);
+    PASS();
+}
+
+TEST(large_data_10mb) {
+    size_t total_size = 10 * 1024 * 1024;
+    uint8_t *original = bp_alloc(total_size);
+    ASSERT(original != NULL);
+    
+    for (size_t i = 0; i < total_size; i++) {
+        original[i] = (uint8_t)(i ^ (i >> 8) ^ (i >> 16));
+    }
+    
+    bp_bundle_full_t bundle;
+    memset(&bundle, 0, sizeof(bundle));
+    bundle.primary.version = 7;
+    bundle.primary.dest_scheme = BP_EID_IPN;
+    bundle.primary.dest_ssp[0] = 2;
+    bundle.primary.dest_ssp[1] = 1;
+    bundle.primary.source_scheme = BP_EID_IPN;
+    bundle.primary.source_ssp[0] = 1;
+    bundle.primary.source_ssp[1] = 1;
+    bundle.primary.report_scheme = BP_EID_IPN;
+    bundle.primary.creation_ts = 20000;
+    bundle.primary.creation_seq = 1;
+    bundle.primary.lifetime_ms = 3600000;
+    bundle.payload = original;
+    bundle.payload_len = total_size;
+    
+    bp_bundle_full_t *frags = NULL;
+    size_t frag_count = 0;
+    int rc = bp_fragment_bundle(&bundle, 64 * 1024, &frags, &frag_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT(frag_count > 100);
+    
+    bp_fragment_ctx_t ctx;
+    bp_fragment_ctx_init(&ctx);
+    
+    bp_bundle_full_t complete;
+    int is_complete = 0;
+    
+    for (size_t i = 0; i < frag_count; i++) {
+        rc = bp_fragment_add(&ctx, &frags[i], &complete);
+        ASSERT(rc >= 0);
+        if (rc == 1) is_complete = 1;
+    }
+    
+    ASSERT(is_complete);
+    ASSERT_EQ(complete.payload_len, total_size);
+    
+    int match = 1;
+    for (size_t i = 0; i < total_size && match; i++) {
+        if (complete.payload[i] != original[i]) match = 0;
+    }
+    ASSERT(match);
+    
+    bp_free(complete.payload);
+    bp_free(complete.primary.dest_uri);
+    bp_free(complete.primary.source_uri);
+    bp_free(complete.primary.report_uri);
+    bp_free(original);
+    bp_fragment_free_array(frags, frag_count);
+    bp_fragment_ctx_free(&ctx);
+    
+    PASS();
+}
+
 int main(void) {
     printf("\n=== BP-SDK Phase 2 Test Suite ===\n\n");
     
@@ -450,6 +565,8 @@ int main(void) {
     RUN_TEST(large_fragment_reassembly);
     RUN_TEST(stream_throughput_measurement);
     RUN_TEST(multiple_concurrent_streams);
+    RUN_TEST(fragment_loss_timeout);
+    RUN_TEST(large_data_10mb);
     
     printf("\n=== Results: %d passed, %d failed ===\n\n", tests_passed, tests_failed);
     
