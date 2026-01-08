@@ -96,6 +96,12 @@ int bp_send(const char *source_eid, const char *dest_eid, const void *payload, s
     DELEGATE(send, source_eid, dest_eid, payload, payload_len, priority, custody, ttl, report_to_eid);
 }
 
+int bp_send_raw(const void *wire_bundle, size_t wire_len) {
+    if (!wire_bundle || wire_len == 0)
+        return BP_ERROR_INVALID_ARGS;
+    DELEGATE(send_raw, wire_bundle, wire_len);
+}
+
 int bp_receive(bp_endpoint_t *endpoint, bp_bundle_t **bundle, int timeout_ms) {
     if (!endpoint || !bundle) return BP_ERROR_INVALID_ARGS;
     DELEGATE(receive, endpoint->endpoint_id, bundle, timeout_ms);

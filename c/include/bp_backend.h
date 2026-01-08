@@ -13,6 +13,7 @@ typedef struct {
     
     int (*send)(const char *source_eid, const char *dest_eid, const void *payload, size_t payload_len, 
                 bp_priority_t priority, bp_custody_t custody, uint32_t ttl, const char *report_to_eid);
+    int (*send_raw)(const void *wire_bundle, size_t wire_len);
     int (*receive)(const char *local_eid, bp_bundle_t **bundle, int timeout_ms);
     int (*bundle_free)(bp_bundle_t *bundle);
     

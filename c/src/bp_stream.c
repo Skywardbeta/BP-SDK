@@ -7,6 +7,7 @@
 #include "bp_stream.h"
 #include "bp_bundle.h"
 #include "bp_utils.h"
+#include "bp_sdk.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -76,6 +77,11 @@ bp_stream_t *bp_stream_create(const char *local_eid, const char *remote_eid,
         s->config.buffer_size = BP_STREAM_DEFAULT_BUFFER_SIZE;
         s->config.timeout_ms = 30000;
     }
+    
+    /* Validate config to prevent infinite loops/hangs */
+    if (s->config.fragment_size == 0) s->config.fragment_size = BP_STREAM_DEFAULT_FRAGMENT_SIZE;
+    if (s->config.max_in_flight == 0) s->config.max_in_flight = BP_STREAM_DEFAULT_MAX_IN_FLIGHT;
+    if (s->config.buffer_size == 0) s->config.buffer_size = BP_STREAM_DEFAULT_BUFFER_SIZE;
     
     s->send_cap = s->config.buffer_size;
     s->send_buf = bp_alloc(s->send_cap);
@@ -162,9 +168,7 @@ static int send_fragment(bp_stream_t *s, const uint8_t *data, size_t len,
         return -1;
     }
     
-    int rc = bp_send(s->local_eid, s->remote_eid, encoded, (size_t)enc_len,
-                     BP_PRIORITY_STANDARD, BP_CUSTODY_NONE, 
-                     s->config.timeout_ms / 1000, NULL);
+    int rc = bp_send_raw(encoded, (size_t)enc_len);
     
     bp_free(encoded);
     
@@ -226,12 +230,6 @@ int bp_stream_flush(bp_stream_t *stream) {
     uint64_t creation_seq = stream->transfer_id++;
     
     while (offset < total_len && !stream->closed) {
-        while (stream->in_flight >= stream->config.max_in_flight && !stream->closed) {
-            MUTEX_UNLOCK(stream->mutex);
-            SLEEP_MS(1);
-            MUTEX_LOCK(stream->mutex);
-        }
-        
         if (stream->closed) {
             rc = BP_ERROR_INVALID_ARGS;
             break;
@@ -243,13 +241,11 @@ int bp_stream_flush(bp_stream_t *stream) {
                           offset, total_len, creation_ts, creation_seq);
         if (rc != BP_SUCCESS) break;
         
-        stream->in_flight++;
         offset += chunk;
     }
     
     stream->send_len = 0;
     stream->stats.bytes_pending = 0;
-    stream->in_flight = 0;
     
     MUTEX_UNLOCK(stream->mutex);
     return rc;
@@ -383,11 +379,14 @@ int bp_stream_is_complete(bp_stream_t *stream) {
     if (!stream) return 0;
     
     MUTEX_LOCK(stream->mutex);
-    int complete = (stream->recv_len > stream->recv_pos) || 
-                   (bp_fragment_pending_count(&stream->frag_ctx) == 0);
+    int has_data = (stream->recv_len > stream->recv_pos);
+    int no_pending = (bp_fragment_pending_count(&stream->frag_ctx) == 0);
     MUTEX_UNLOCK(stream->mutex);
     
-    return complete;
+    /* Returns true only when data is available AND no fragments pending.
+     * Note: Returns false after all data has been read, even if transfer completed.
+     * Use bp_stream_read_available() to drain buffer, then check no_pending. */
+    return has_data && no_pending;
 }
 
 int bp_stream_send_file(bp_stream_t *stream, const char *filepath) {

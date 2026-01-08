@@ -121,6 +121,7 @@ int bp_endpoint_unregister(bp_endpoint_t *endpoint);
 
 int bp_send(const char *source_eid, const char *dest_eid, const void *payload, size_t payload_len, 
             bp_priority_t priority, bp_custody_t custody, uint32_t ttl, const char *report_to_eid);
+int bp_send_raw(const void *wire_bundle, size_t wire_len);
 int bp_receive(bp_endpoint_t *endpoint, bp_bundle_t **bundle, int timeout_ms);
 int bp_bundle_free(bp_bundle_t *bundle);
 
