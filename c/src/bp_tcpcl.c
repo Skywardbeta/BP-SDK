@@ -1,5 +1,6 @@
 /* bp_tcpcl.c - TCPCLv4 (RFC 9174) */
 #include "bp_tcpcl.h"
+#include "bp_utils.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -15,6 +16,9 @@
 
 static const uint8_t TCPCL_MAGIC[4] = {'d', 't', 'n', '!'};
 #define TCPCL_VERSION 4
+#define TCPCL_MAX_NODE_ID_LEN   1024
+#define TCPCL_MAX_SEGMENT_SIZE  (16 * 1024 * 1024)
+#define TCPCL_MAX_TRANSFER_SIZE (256 * 1024 * 1024)
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t sent = 0;
@@ -101,9 +105,13 @@ int tcpcl_recv_sess_init(tcpcl_session_t *sess) {
 
     if (read_all(sess->fd, hdr, 2) < 0) return -1;
     uint16_t nid_len = (hdr[0] << 8) | hdr[1];
-    uint8_t *nid = malloc(nid_len);
-    if (read_all(sess->fd, nid, nid_len) < 0) { free(nid); return -1; }
-    free(nid);
+    if (nid_len > TCPCL_MAX_NODE_ID_LEN) return -1;
+    if (nid_len > 0) {
+        uint8_t *nid = bp_alloc(nid_len);
+        if (!nid) return -1;
+        if (read_all(sess->fd, nid, nid_len) < 0) { bp_free(nid); return -1; }
+        bp_free(nid);
+    }
     if (read_all(sess->fd, hdr, 4) < 0) return -1;
 
     sess->connected = 1;
@@ -146,28 +154,44 @@ int tcpcl_recv_bundle(tcpcl_session_t *sess, uint8_t **data, size_t *len) {
 
     uint8_t *buf = NULL;
     size_t buf_len = 0;
-    uint64_t transfer_id = 0;
+    uint64_t expected_tid = 0;
+    int first_segment = 1;
     int done = 0;
 
     while (!done) {
         uint8_t hdr[18];
-        if (read_all(sess->fd, hdr, 18) < 0) { free(buf); return -1; }
-        if (hdr[0] != TCPCL_MSG_XFER_SEG) { free(buf); return -1; }
+        if (read_all(sess->fd, hdr, 18) < 0) { bp_free(buf); return -1; }
+        if (hdr[0] != TCPCL_MSG_XFER_SEG) { bp_free(buf); return -1; }
 
         uint8_t flags = hdr[1];
-        transfer_id = decode_uint64(hdr + 2);
+        uint64_t tid = decode_uint64(hdr + 2);
         uint64_t seg_len = decode_uint64(hdr + 10);
 
-        buf = realloc(buf, buf_len + seg_len);
-        if (read_all(sess->fd, buf + buf_len, seg_len) < 0) { free(buf); return -1; }
-        buf_len += seg_len;
+        /* Validate transfer_id consistency across segments */
+        if (first_segment) {
+            expected_tid = tid;
+            first_segment = 0;
+        } else if (tid != expected_tid) {
+            bp_free(buf);
+            return -1;
+        }
+
+        if (seg_len > TCPCL_MAX_SEGMENT_SIZE) { bp_free(buf); return -1; }
+        if (buf_len + seg_len > TCPCL_MAX_TRANSFER_SIZE) { bp_free(buf); return -1; }
+
+        uint8_t *new_buf = bp_realloc(buf, buf_len + (size_t)seg_len);
+        if (!new_buf) { bp_free(buf); return -1; }
+        buf = new_buf;
+
+        if (read_all(sess->fd, buf + buf_len, (size_t)seg_len) < 0) { bp_free(buf); return -1; }
+        buf_len += (size_t)seg_len;
         if (flags & TCPCL_SEG_END) done = 1;
     }
 
     uint8_t ack[18];
     ack[0] = TCPCL_MSG_XFER_ACK;
     ack[1] = TCPCL_SEG_END;
-    encode_uint64(ack + 2, transfer_id);
+    encode_uint64(ack + 2, expected_tid);
     encode_uint64(ack + 10, buf_len);
     write_all(sess->fd, ack, 18);
 
