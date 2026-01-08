@@ -12,40 +12,52 @@ if not exist build mkdir build
 
 echo === BP-SDK Build ===
 
-echo [1/9] Compiling SDK Core...
+echo [1/10] Compiling SDK Core...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_sdk.c -o build/bp_sdk.o
 if %errorlevel% neq 0 goto :error
 
-echo [2/9] Compiling Utilities...
+echo [2/10] Compiling Utilities...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_utils.c -o build/bp_utils.o
 if %errorlevel% neq 0 goto :error
 
-echo [3/9] Compiling CBOR...
+echo [3/10] Compiling CBOR...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_cbor.c -o build/bp_cbor.o
 if %errorlevel% neq 0 goto :error
 
-echo [4/9] Compiling Bundle...
+echo [4/10] Compiling Bundle...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bundle.c -o build/bp_bundle.o
 if %errorlevel% neq 0 goto :error
 
-echo [5/9] Compiling TCPCL...
+echo [5/10] Compiling TCPCL...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_tcpcl.c -o build/bp_tcpcl.o
 if %errorlevel% neq 0 goto :error
 
-echo [6/9] Compiling BPSec...
+echo [6/10] Compiling BPSec...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec.c -o build/bp_bpsec.o
 if %errorlevel% neq 0 goto :error
 
-echo [7/9] Compiling Fragmentation...
+echo [6b/10] Compiling BPSec Keys...
+gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec_keys.c -o build/bp_bpsec_keys.o
+if %errorlevel% neq 0 goto :error
+
+echo [6c/10] Compiling BPSec Policy...
+gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec_policy.c -o build/bp_bpsec_policy.o
+if %errorlevel% neq 0 goto :error
+
+echo [7/10] Compiling Fragmentation...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_fragment.c -o build/bp_fragment.o
 if %errorlevel% neq 0 goto :error
 
-echo [8/9] Compiling Storage...
+echo [8/10] Compiling Storage...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_storage.c -o build/bp_storage.o
 if %errorlevel% neq 0 goto :error
 
-echo [9/9] Compiling Admin...
+echo [9/10] Compiling Admin...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_admin.c -o build/bp_admin.o
+if %errorlevel% neq 0 goto :error
+
+echo [10/10] Compiling Stream...
+gcc -I./include -Wall -Wextra -std=c11 -c src/bp_stream.c -o build/bp_stream.o
 if %errorlevel% neq 0 goto :error
 
 echo Compiling POSIX Backend...
@@ -57,7 +69,7 @@ gcc -I./include -Wall -Wextra -std=c11 -c src/backend/bp_backend_bpsocket.c -o b
 if %errorlevel% neq 0 goto :error
 
 echo Creating Library...
-ar rcs build/libbp_sdk.a build/bp_sdk.o build/bp_utils.o build/bp_cbor.o build/bp_bundle.o build/bp_tcpcl.o build/bp_bpsec.o build/bp_fragment.o build/bp_storage.o build/bp_admin.o build/bp_backend_posix.o build/bp_backend_bpsocket.o
+ar rcs build/libbp_sdk.a build/bp_sdk.o build/bp_utils.o build/bp_cbor.o build/bp_bundle.o build/bp_tcpcl.o build/bp_bpsec.o build/bp_bpsec_keys.o build/bp_bpsec_policy.o build/bp_fragment.o build/bp_storage.o build/bp_admin.o build/bp_stream.o build/bp_backend_posix.o build/bp_backend_bpsocket.o
 if %errorlevel% neq 0 goto :error
 
 echo.
@@ -72,6 +84,14 @@ if exist tests (
     gcc -I./include -Wall -Wextra -std=c11 tests/test_concurrency.c -L./build -lbp_sdk -lws2_32 -o build/test_concurrency.exe
     if %errorlevel% neq 0 echo Warning: test_concurrency build failed
 
+    echo Building test_phase2...
+    gcc -I./include -Wall -Wextra -std=c11 tests/test_phase2.c -L./build -lbp_sdk -lws2_32 -o build/test_phase2.exe
+    if %errorlevel% neq 0 echo Warning: test_phase2 build failed
+
+    echo Building test_phase3a...
+    gcc -I./include -Wall -Wextra -std=c11 tests/test_phase3a.c -L./build -lbp_sdk -lws2_32 -o build/test_phase3a.exe
+    if %errorlevel% neq 0 echo Warning: test_phase3a build failed
+
     if exist examples\test_bpsec.c (
         echo Building test_bpsec...
         gcc -I./include -Wall -Wextra -std=c11 examples/test_bpsec.c -L./build -lbp_sdk -lws2_32 -o build/test_bpsec.exe
@@ -84,6 +104,8 @@ echo === Build successful: build/libbp_sdk.a ===
 echo.
 echo To run tests:
 echo   build\test_phase1.exe
+echo   build\test_phase2.exe
+echo   build\test_phase3a.exe
 echo   build\test_concurrency.exe
 echo   build\test_bpsec.exe
 exit /b 0

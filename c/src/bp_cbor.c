@@ -166,7 +166,10 @@ int cbor_skip(cbor_decoder_t *dec) {
             break;
         case CBOR_TYPE_ARRAY:
             if (val == (uint64_t)-1) {
-                while (dec->buf[dec->pos] != CBOR_BREAK) { if (cbor_skip(dec) < 0) return -1; }
+                while (dec->pos < dec->len && dec->buf[dec->pos] != CBOR_BREAK) {
+                    if (cbor_skip(dec) < 0) return -1;
+                }
+                if (dec->pos >= dec->len) { dec->error = 1; return -1; }
                 dec->pos++;
             } else {
                 for (uint64_t i = 0; i < val; i++) { if (cbor_skip(dec) < 0) return -1; }
@@ -174,10 +177,11 @@ int cbor_skip(cbor_decoder_t *dec) {
             break;
         case CBOR_TYPE_MAP:
             if (val == (uint64_t)-1) {
-                while (dec->buf[dec->pos] != CBOR_BREAK) {
+                while (dec->pos < dec->len && dec->buf[dec->pos] != CBOR_BREAK) {
                     if (cbor_skip(dec) < 0) return -1;
                     if (cbor_skip(dec) < 0) return -1;
                 }
+                if (dec->pos >= dec->len) { dec->error = 1; return -1; }
                 dec->pos++;
             } else {
                 for (uint64_t i = 0; i < val * 2; i++) { if (cbor_skip(dec) < 0) return -1; }

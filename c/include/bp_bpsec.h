@@ -13,6 +13,11 @@
 
 #define BPSEC_FLAG_PARAMS_PRESENT 0x01
 
+/* AES-256-GCM requires exactly 32-byte key and 12-byte IV */
+#define BPSEC_AES256_KEY_LEN      32
+#define BPSEC_AES_GCM_IV_LEN      12
+#define BPSEC_AES_GCM_TAG_LEN     16
+
 typedef struct {
     uint8_t sha_variant;
     uint8_t *wrapped_key;
@@ -60,12 +65,12 @@ int bpsec_verify_hmac_sha256(const uint8_t *key, size_t key_len,
                              const uint8_t *data, size_t data_len,
                              const uint8_t *sig, size_t sig_len);
 
-int bpsec_encrypt_aes_gcm(const uint8_t *key, const uint8_t *iv,
+int bpsec_encrypt_aes_gcm(const uint8_t *key, size_t key_len, const uint8_t *iv,
                           const uint8_t *plain, size_t plain_len,
                           const uint8_t *aad, size_t aad_len,
                           uint8_t *cipher, uint8_t *tag);
 
-int bpsec_decrypt_aes_gcm(const uint8_t *key, const uint8_t *iv,
+int bpsec_decrypt_aes_gcm(const uint8_t *key, size_t key_len, const uint8_t *iv,
                           const uint8_t *cipher, size_t cipher_len,
                           const uint8_t *aad, size_t aad_len,
                           const uint8_t *tag, uint8_t *plain);

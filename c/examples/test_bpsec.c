@@ -141,12 +141,12 @@ TEST(aes_gcm_encrypt_decrypt_basic) {
     uint8_t decrypted[sizeof(plain)];
     uint8_t tag[16];
     
-    int rc = bpsec_encrypt_aes_gcm(key, iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
+    int rc = bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
     ASSERT_EQ(rc, 0);
     
     ASSERT(memcmp(cipher, plain, sizeof(plain) - 1) != 0);
     
-    rc = bpsec_decrypt_aes_gcm(key, iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
+    rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
     ASSERT_EQ(rc, 0);
     ASSERT_MEM_EQ(decrypted, plain, sizeof(plain) - 1);
     
@@ -163,10 +163,10 @@ TEST(aes_gcm_with_aad) {
     uint8_t decrypted[sizeof(plain)];
     uint8_t tag[16];
     
-    int rc = bpsec_encrypt_aes_gcm(key, iv, plain, sizeof(plain) - 1, aad, sizeof(aad) - 1, cipher, tag);
+    int rc = bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, sizeof(plain) - 1, aad, sizeof(aad) - 1, cipher, tag);
     ASSERT_EQ(rc, 0);
     
-    rc = bpsec_decrypt_aes_gcm(key, iv, cipher, sizeof(plain) - 1, aad, sizeof(aad) - 1, tag, decrypted);
+    rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, sizeof(plain) - 1, aad, sizeof(aad) - 1, tag, decrypted);
     ASSERT_EQ(rc, 0);
     ASSERT_MEM_EQ(decrypted, plain, sizeof(plain) - 1);
     
@@ -181,10 +181,10 @@ TEST(aes_gcm_auth_fail_wrong_tag) {
     uint8_t decrypted[sizeof(plain)];
     uint8_t tag[16];
     
-    bpsec_encrypt_aes_gcm(key, iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
+    bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
     
     tag[0] ^= 0x01;
-    int rc = bpsec_decrypt_aes_gcm(key, iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
+    int rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
     ASSERT(rc != 0);
     
     PASS();
@@ -200,9 +200,9 @@ TEST(aes_gcm_auth_fail_wrong_aad) {
     uint8_t decrypted[sizeof(plain)];
     uint8_t tag[16];
     
-    bpsec_encrypt_aes_gcm(key, iv, plain, sizeof(plain) - 1, aad, sizeof(aad) - 1, cipher, tag);
+    bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, sizeof(plain) - 1, aad, sizeof(aad) - 1, cipher, tag);
     
-    int rc = bpsec_decrypt_aes_gcm(key, iv, cipher, sizeof(plain) - 1, wrong_aad, sizeof(wrong_aad) - 1, tag, decrypted);
+    int rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, sizeof(plain) - 1, wrong_aad, sizeof(wrong_aad) - 1, tag, decrypted);
     ASSERT(rc != 0);
     
     PASS();
@@ -216,10 +216,10 @@ TEST(aes_gcm_auth_fail_tampered_cipher) {
     uint8_t decrypted[sizeof(plain)];
     uint8_t tag[16];
     
-    bpsec_encrypt_aes_gcm(key, iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
+    bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, sizeof(plain) - 1, NULL, 0, cipher, tag);
     
     cipher[5] ^= 0xff;
-    int rc = bpsec_decrypt_aes_gcm(key, iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
+    int rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, sizeof(plain) - 1, NULL, 0, tag, decrypted);
     ASSERT(rc != 0);
     
     PASS();
@@ -241,10 +241,10 @@ TEST(aes_gcm_large_data) {
     
     for (size_t i = 0; i < data_len; i++) plain[i] = (uint8_t)(i & 0xff);
     
-    int rc = bpsec_encrypt_aes_gcm(key, iv, plain, data_len, NULL, 0, cipher, tag);
+    int rc = bpsec_encrypt_aes_gcm(key, sizeof(key), iv, plain, data_len, NULL, 0, cipher, tag);
     ASSERT_EQ(rc, 0);
     
-    rc = bpsec_decrypt_aes_gcm(key, iv, cipher, data_len, NULL, 0, tag, decrypted);
+    rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, cipher, data_len, NULL, 0, tag, decrypted);
     ASSERT_EQ(rc, 0);
     ASSERT_MEM_EQ(decrypted, plain, data_len);
     
@@ -262,10 +262,10 @@ TEST(aes_gcm_empty_plaintext) {
     uint8_t tag[16];
     uint8_t dummy[1];
     
-    int rc = bpsec_encrypt_aes_gcm(key, iv, NULL, 0, aad, sizeof(aad) - 1, dummy, tag);
+    int rc = bpsec_encrypt_aes_gcm(key, sizeof(key), iv, NULL, 0, aad, sizeof(aad) - 1, dummy, tag);
     ASSERT_EQ(rc, 0);
     
-    rc = bpsec_decrypt_aes_gcm(key, iv, NULL, 0, aad, sizeof(aad) - 1, tag, dummy);
+    rc = bpsec_decrypt_aes_gcm(key, sizeof(key), iv, NULL, 0, aad, sizeof(aad) - 1, tag, dummy);
     ASSERT_EQ(rc, 0);
     
     PASS();
@@ -424,16 +424,20 @@ TEST(aes_gcm_null_params) {
     uint8_t buf[16] = {0};
     uint8_t tag[16] = {0};
     
-    int rc = bpsec_encrypt_aes_gcm(NULL, iv, buf, 16, NULL, 0, buf, tag);
+    int rc = bpsec_encrypt_aes_gcm(NULL, 32, iv, buf, 16, NULL, 0, buf, tag);
     ASSERT(rc != 0);
     
-    rc = bpsec_encrypt_aes_gcm(key, NULL, buf, 16, NULL, 0, buf, tag);
+    rc = bpsec_encrypt_aes_gcm(key, 32, NULL, buf, 16, NULL, 0, buf, tag);
     ASSERT(rc != 0);
     
-    rc = bpsec_encrypt_aes_gcm(key, iv, buf, 16, NULL, 0, NULL, tag);
+    rc = bpsec_encrypt_aes_gcm(key, 32, iv, buf, 16, NULL, 0, NULL, tag);
     ASSERT(rc != 0);
     
-    rc = bpsec_encrypt_aes_gcm(key, iv, buf, 16, NULL, 0, buf, NULL);
+    rc = bpsec_encrypt_aes_gcm(key, 32, iv, buf, 16, NULL, 0, buf, NULL);
+    ASSERT(rc != 0);
+    
+    /* Test invalid key length */
+    rc = bpsec_encrypt_aes_gcm(key, 16, iv, buf, 16, NULL, 0, buf, tag);
     ASSERT(rc != 0);
     
     PASS();

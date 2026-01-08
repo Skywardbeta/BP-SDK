@@ -1,7 +1,14 @@
-/* bp_fragment.c - Bundle Fragmentation/Reassembly */
+/*
+ * bp_fragment.c - Bundle Fragmentation/Reassembly with Timeout Support
+ */
 #include "bp_fragment.h"
 #include "bp_utils.h"
 #include <string.h>
+#include <time.h>
+
+static uint64_t get_time_ms(void) {
+    return (uint64_t)time(NULL) * 1000;
+}
 
 static int copy_primary(bp_primary_t *dst, const bp_primary_t *src) {
     *dst = *src;
@@ -35,7 +42,7 @@ fail:
 
 int bp_fragment_bundle(const bp_bundle_full_t *original, size_t max_size,
                        bp_bundle_full_t **frags, size_t *count) {
-    if (!original || !frags || !count || max_size < 100) return -1;
+    if (!original || !frags || !count || max_size < BP_FRAGMENT_MIN_SIZE) return -1;
     
     *frags = NULL;
     *count = 0;
@@ -118,13 +125,28 @@ void bp_fragment_free_array(bp_bundle_full_t *frags, size_t count) {
     bp_free(frags);
 }
 
-void bp_fragment_ctx_init(bp_fragment_ctx_t *ctx) { memset(ctx, 0, sizeof(*ctx)); }
+void bp_fragment_ctx_init(bp_fragment_ctx_t *ctx) {
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->default_timeout_ms = BP_FRAGMENT_DEFAULT_TIMEOUT_MS;
+}
+
+void bp_fragment_ctx_init_with_timeout(bp_fragment_ctx_t *ctx, uint64_t timeout_ms) {
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->default_timeout_ms = timeout_ms > 0 ? timeout_ms : BP_FRAGMENT_DEFAULT_TIMEOUT_MS;
+}
+
+static void free_entry(bp_fragment_entry_t *e) {
+    bp_free(e->assembled);
+    bp_free(e->bitmap);
+    memset(e, 0, sizeof(*e));
+}
 
 void bp_fragment_ctx_free(bp_fragment_ctx_t *ctx) {
+    if (!ctx) return;
     for (size_t i = 0; i < ctx->count; i++) {
-        bp_free(ctx->entries[i].source_eid);
-        bp_free(ctx->entries[i].assembled);
-        bp_free(ctx->entries[i].bitmap);
+        free_entry(&ctx->entries[i]);
     }
     bp_free(ctx->entries);
     memset(ctx, 0, sizeof(*ctx));
@@ -133,10 +155,33 @@ void bp_fragment_ctx_free(bp_fragment_ctx_t *ctx) {
 static bp_fragment_entry_t *find_entry(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag) {
     for (size_t i = 0; i < ctx->count; i++) {
         bp_fragment_entry_t *e = &ctx->entries[i];
-        if (e->creation_ts == frag->primary.creation_ts && e->creation_seq == frag->primary.creation_seq)
+        if (e->assembled && 
+            e->creation_ts == frag->primary.creation_ts && 
+            e->creation_seq == frag->primary.creation_seq) {
             return e;
+        }
     }
     return NULL;
+}
+
+static bp_fragment_entry_t *alloc_entry(bp_fragment_ctx_t *ctx) {
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (!ctx->entries[i].assembled) {
+            return &ctx->entries[i];
+        }
+    }
+    
+    if (ctx->count >= ctx->capacity) {
+        size_t new_cap = ctx->capacity ? ctx->capacity * 2 : 4;
+        bp_fragment_entry_t *new_entries = bp_realloc(ctx->entries, 
+                                                       new_cap * sizeof(bp_fragment_entry_t));
+        if (!new_entries) return NULL;
+        ctx->entries = new_entries;
+        ctx->capacity = new_cap;
+        memset(&ctx->entries[ctx->count], 0, (new_cap - ctx->count) * sizeof(bp_fragment_entry_t));
+    }
+    
+    return &ctx->entries[ctx->count++];
 }
 
 int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bundle_full_t *complete) {
@@ -168,39 +213,43 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
 
     bp_fragment_entry_t *e = find_entry(ctx, frag);
     if (!e) {
-        if (ctx->count >= ctx->capacity) {
-            size_t new_cap = ctx->capacity ? ctx->capacity * 2 : 4;
-            bp_fragment_entry_t *new_entries = bp_realloc(ctx->entries, 
-                                                           new_cap * sizeof(bp_fragment_entry_t));
-            if (!new_entries) return -1;
-            ctx->entries = new_entries;
-            ctx->capacity = new_cap;
-        }
+        e = alloc_entry(ctx);
+        if (!e) return -1;
         
-        e = &ctx->entries[ctx->count];
         memset(e, 0, sizeof(*e));
         e->creation_ts = frag->primary.creation_ts;
         e->creation_seq = frag->primary.creation_seq;
         e->total_len = frag->primary.total_adu_len;
         
-        e->assembled = bp_alloc(e->total_len);
-        if (!e->assembled) return -1;
-        memset(e->assembled, 0, e->total_len);
+        uint64_t timeout = frag->primary.lifetime_ms > 0 ? 
+                           frag->primary.lifetime_ms : ctx->default_timeout_ms;
+        e->expiry_time = get_time_ms() + timeout;
         
-        size_t bitmap_size = (e->total_len + 7) / 8;
+        e->assembled = bp_alloc((size_t)e->total_len);
+        if (!e->assembled) {
+            memset(e, 0, sizeof(*e));
+            return -1;
+        }
+        memset(e->assembled, 0, (size_t)e->total_len);
+        
+        size_t bitmap_size = ((size_t)e->total_len + 7) / 8;
         e->bitmap = bp_alloc(bitmap_size);
         if (!e->bitmap) {
             bp_free(e->assembled);
-            e->assembled = NULL;
+            memset(e, 0, sizeof(*e));
             return -1;
         }
         memset(e->bitmap, 0, bitmap_size);
-        e->assembled_len = 0;
-        
-        ctx->count++;
+        e->bytes_received = 0;
     }
 
     if (frag->payload && len > 0) {
+        for (size_t i = off; i < off + len; i++) {
+            if (!(e->bitmap[i / 8] & (1 << (i % 8)))) {
+                e->bytes_received++;
+            }
+        }
+        
         memcpy(e->assembled + off, frag->payload, len);
         
         for (size_t i = off; i < off + len; i++) {
@@ -208,15 +257,7 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
         }
     }
 
-    int complete_flag = 1;
-    for (size_t i = 0; i < e->total_len; i++) {
-        if (!(e->bitmap[i / 8] & (1 << (i % 8)))) {
-            complete_flag = 0;
-            break;
-        }
-    }
-
-    if (complete_flag) {
+    if (e->bytes_received == e->total_len) {
         memset(complete, 0, sizeof(*complete));
         if (copy_primary(&complete->primary, &frag->primary) < 0) {
             return -1;
@@ -225,9 +266,50 @@ int bp_fragment_add(bp_fragment_ctx_t *ctx, const bp_bundle_full_t *frag, bp_bun
         complete->primary.fragment_offset = 0;
         complete->primary.total_adu_len = 0;
         complete->payload = e->assembled;
-        complete->payload_len = e->total_len;
+        complete->payload_len = (size_t)e->total_len;
+        
         e->assembled = NULL;
+        free_entry(e);
         return 1;
     }
     return 0;
+}
+
+size_t bp_fragment_expire(bp_fragment_ctx_t *ctx, uint64_t current_time_ms) {
+    if (!ctx) return 0;
+    
+    size_t expired = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        bp_fragment_entry_t *e = &ctx->entries[i];
+        if (e->assembled && current_time_ms >= e->expiry_time) {
+            BP_LOG_DEBUG("Fragment expired: ts=%llu seq=%llu (received %llu/%llu bytes)",
+                         (unsigned long long)e->creation_ts,
+                         (unsigned long long)e->creation_seq,
+                         (unsigned long long)e->bytes_received,
+                         (unsigned long long)e->total_len);
+            free_entry(e);
+            expired++;
+        }
+    }
+    return expired;
+}
+
+size_t bp_fragment_pending_count(const bp_fragment_ctx_t *ctx) {
+    if (!ctx) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (ctx->entries[i].assembled) count++;
+    }
+    return count;
+}
+
+size_t bp_fragment_pending_bytes(const bp_fragment_ctx_t *ctx) {
+    if (!ctx) return 0;
+    size_t bytes = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (ctx->entries[i].assembled) {
+            bytes += (size_t)ctx->entries[i].total_len;
+        }
+    }
+    return bytes;
 }

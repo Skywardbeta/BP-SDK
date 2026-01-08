@@ -3,6 +3,7 @@
  */
 #include "bp_bundle.h"
 #include "bp_cbor.h"
+#include "bp_utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -44,7 +45,10 @@ int bp_eid_parse(const char *eid, uint8_t *scheme, uint64_t ssp[2], char **uri) 
             return -1;
     } else if (strncmp(eid, "dtn:", 4) == 0) {
         *scheme = BP_EID_DTN;
-        if (uri) *uri = strdup(eid + 4);
+        if (uri) {
+            *uri = strdup(eid + 4);
+            if (!*uri) return -1;
+        }
     } else {
         return -1;
     }
@@ -208,13 +212,14 @@ static int decode_eid(cbor_decoder_t *dec, uint8_t *scheme, uint64_t ssp[2], cha
             size_t len;
             if (cbor_decode_text(dec, &str, &len) < 0) return -1;
             if (uri) {
-                *uri = malloc(len + 1);
+                *uri = bp_alloc(len + 1);
+                if (!*uri) return -1;
                 memcpy(*uri, str, len);
                 (*uri)[len] = '\0';
             }
         } else {
             uint64_t v;
-            cbor_decode_uint(dec, &v); /* dtn:none */
+            if (cbor_decode_uint(dec, &v) < 0) return -1; /* dtn:none */
         }
     }
     return 0;
@@ -240,80 +245,111 @@ int bp_bundle_decode(const uint8_t *data, size_t len, bp_bundle_full_t *bundle) 
     if (cbor_decode_uint(&dec, &tmp) < 0) return -1;
     bundle->primary.crc_type = (uint8_t)tmp;
 
-    if (decode_eid(&dec, &bundle->primary.dest_scheme, bundle->primary.dest_ssp, &bundle->primary.dest_uri) < 0) return -1;
-    if (decode_eid(&dec, &bundle->primary.source_scheme, bundle->primary.source_ssp, &bundle->primary.source_uri) < 0) return -1;
-    if (decode_eid(&dec, &bundle->primary.report_scheme, bundle->primary.report_ssp, &bundle->primary.report_uri) < 0) return -1;
+    if (decode_eid(&dec, &bundle->primary.dest_scheme, bundle->primary.dest_ssp, &bundle->primary.dest_uri) < 0) goto fail;
+    if (decode_eid(&dec, &bundle->primary.source_scheme, bundle->primary.source_ssp, &bundle->primary.source_uri) < 0) goto fail;
+    if (decode_eid(&dec, &bundle->primary.report_scheme, bundle->primary.report_ssp, &bundle->primary.report_uri) < 0) goto fail;
 
     /* Creation timestamp */
     size_t ts_len;
-    if (cbor_decode_array(&dec, &ts_len) < 0 || ts_len != 2) return -1;
-    if (cbor_decode_uint(&dec, &bundle->primary.creation_ts) < 0) return -1;
-    if (cbor_decode_uint(&dec, &bundle->primary.creation_seq) < 0) return -1;
+    if (cbor_decode_array(&dec, &ts_len) < 0 || ts_len != 2) goto fail;
+    if (cbor_decode_uint(&dec, &bundle->primary.creation_ts) < 0) goto fail;
+    if (cbor_decode_uint(&dec, &bundle->primary.creation_seq) < 0) goto fail;
 
-    if (cbor_decode_uint(&dec, &bundle->primary.lifetime_ms) < 0) return -1;
+    if (cbor_decode_uint(&dec, &bundle->primary.lifetime_ms) < 0) goto fail;
 
     if (bundle->primary.flags & BP_FLAG_FRAGMENT) {
-        if (cbor_decode_uint(&dec, &bundle->primary.fragment_offset) < 0) return -1;
-        if (cbor_decode_uint(&dec, &bundle->primary.total_adu_len) < 0) return -1;
+        if (cbor_decode_uint(&dec, &bundle->primary.fragment_offset) < 0) goto fail;
+        if (cbor_decode_uint(&dec, &bundle->primary.total_adu_len) < 0) goto fail;
     }
 
     if (bundle->primary.crc_type != BP_CRC_NONE) {
-        cbor_skip(&dec);
+        if (cbor_skip(&dec) < 0 || dec.error) goto fail;
     }
 
     /* Decode blocks until break */
     bp_block_t *blocks = NULL;
     size_t block_cap = 0, block_cnt = 0;
 
-    while (dec.buf[dec.pos] != CBOR_BREAK) {
+    while (dec.pos < dec.len && dec.buf[dec.pos] != CBOR_BREAK) {
         size_t blk_len;
-        if (cbor_decode_array(&dec, &blk_len) < 0) break;
+        if (cbor_decode_array(&dec, &blk_len) < 0) goto fail;
 
         bp_block_t blk = {0};
-        if (cbor_decode_uint(&dec, &tmp) < 0) break;
+        if (cbor_decode_uint(&dec, &tmp) < 0) goto fail;
         blk.type = (uint8_t)tmp;
-        if (cbor_decode_uint(&dec, &blk.number) < 0) break;
-        if (cbor_decode_uint(&dec, &blk.flags) < 0) break;
-        if (cbor_decode_uint(&dec, &tmp) < 0) break;
+        if (cbor_decode_uint(&dec, &blk.number) < 0) goto fail;
+        if (cbor_decode_uint(&dec, &blk.flags) < 0) goto fail;
+        if (cbor_decode_uint(&dec, &tmp) < 0) goto fail;
         blk.crc_type = (uint8_t)tmp;
 
         const uint8_t *bdata;
         size_t blen;
-        if (cbor_decode_bytes(&dec, &bdata, &blen) < 0) break;
-        blk.data = malloc(blen);
-        memcpy(blk.data, bdata, blen);
+        if (cbor_decode_bytes(&dec, &bdata, &blen) < 0) goto fail;
+        
+        if (blen > 0) {
+            blk.data = bp_alloc(blen);
+            if (!blk.data) goto fail;
+            memcpy(blk.data, bdata, blen);
+        }
         blk.data_len = blen;
 
-        if (blk.crc_type != BP_CRC_NONE) cbor_skip(&dec);
+        if (blk.crc_type != BP_CRC_NONE) {
+            if (cbor_skip(&dec) < 0 || dec.error) {
+                bp_free(blk.data);
+                goto fail;
+            }
+        }
 
         if (blk.type == BP_BLOCK_PAYLOAD) {
+            /* Free previous payload if multiple payload blocks (per RFC, only one allowed) */
+            bp_free(bundle->payload);
             bundle->payload = blk.data;
             bundle->payload_len = blk.data_len;
         } else {
             if (block_cnt >= block_cap) {
-                block_cap = block_cap ? block_cap * 2 : 4;
-                blocks = realloc(blocks, block_cap * sizeof(bp_block_t));
+                size_t new_cap = block_cap ? block_cap * 2 : 4;
+                bp_block_t *new_blocks = bp_realloc(blocks, new_cap * sizeof(bp_block_t));
+                if (!new_blocks) {
+                    bp_free(blk.data);
+                    goto fail;
+                }
+                blocks = new_blocks;
+                block_cap = new_cap;
             }
             blocks[block_cnt++] = blk;
         }
     }
+
+    if (dec.pos >= dec.len) goto fail;
 
     bundle->blocks = blocks;
     bundle->block_count = block_cnt;
 
     cbor_decode_break(&dec);
     return dec.error ? -1 : 0;
+
+fail:
+    for (size_t i = 0; i < block_cnt; i++) {
+        bp_free(blocks[i].data);
+    }
+    bp_free(blocks);
+    bp_free(bundle->payload);
+    bp_free(bundle->primary.dest_uri);
+    bp_free(bundle->primary.source_uri);
+    bp_free(bundle->primary.report_uri);
+    memset(bundle, 0, sizeof(*bundle));
+    return -1;
 }
 
 void bp_bundle_full_free(bp_bundle_full_t *bundle) {
     if (!bundle) return;
-    free(bundle->primary.dest_uri);
-    free(bundle->primary.source_uri);
-    free(bundle->primary.report_uri);
+    bp_free(bundle->primary.dest_uri);
+    bp_free(bundle->primary.source_uri);
+    bp_free(bundle->primary.report_uri);
     for (size_t i = 0; i < bundle->block_count; i++) {
-        free(bundle->blocks[i].data);
+        bp_free(bundle->blocks[i].data);
     }
-    free(bundle->blocks);
-    free(bundle->payload);
+    bp_free(bundle->blocks);
+    bp_free(bundle->payload);
     memset(bundle, 0, sizeof(*bundle));
 }

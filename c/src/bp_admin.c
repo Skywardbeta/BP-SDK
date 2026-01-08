@@ -52,7 +52,9 @@ int bp_create_status_report(const bp_bundle_full_t *subject, uint8_t status_flag
     }
     cbor_encode_uint(&enc, bp_time_now_dtn());
 
+    if (enc.error) return -1;
     report->payload = bp_alloc(enc.len);
+    if (!report->payload) return -1;
     memcpy(report->payload, payload, enc.len);
     report->payload_len = enc.len;
     return 0;
@@ -96,7 +98,9 @@ int bp_create_custody_signal(const bp_bundle_full_t *subject, int accepted, uint
     cbor_encode_uint(&enc, subject->primary.source_ssp[0]);
     cbor_encode_uint(&enc, subject->primary.source_ssp[1]);
 
+    if (enc.error) return -1;
     signal->payload = bp_alloc(enc.len);
+    if (!signal->payload) return -1;
     memcpy(signal->payload, payload, enc.len);
     signal->payload_len = enc.len;
     return 0;

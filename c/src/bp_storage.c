@@ -45,16 +45,26 @@ int bp_store_put(bp_store_t *store, const char *id, const uint8_t *data, size_t 
         if (store->current_size + len > store->max_size) return -1;
     }
 
+    /* Allocate new data first to ensure we don't corrupt existing entry on failure */
+    uint8_t *new_data = NULL;
+    if (len > 0) {
+        new_data = bp_alloc(len);
+        if (!new_data) return -1;
+        memcpy(new_data, data, len);
+    }
+
     bp_store_entry_t *e = find_entry(store, id);
     if (e) {
         store->current_size -= e->len;
         bp_free(e->data);
-        e->data = NULL;
     } else {
         if (store->count >= store->capacity) {
             size_t new_cap = store->capacity ? store->capacity * 2 : 16;
             bp_store_entry_t *new_entries = bp_realloc(store->entries, new_cap * sizeof(bp_store_entry_t));
-            if (!new_entries) return -1;
+            if (!new_entries) {
+                bp_free(new_data);
+                return -1;
+            }
             store->entries = new_entries;
             store->capacity = new_cap;
         }
@@ -63,21 +73,12 @@ int bp_store_put(bp_store_t *store, const char *id, const uint8_t *data, size_t 
         e->bundle_id = bp_strdup(id);
         if (!e->bundle_id) {
             store->count--;
+            bp_free(new_data);
             return -1;
         }
     }
 
-    if (len > 0) {
-        e->data = bp_alloc(len);
-        if (!e->data) {
-            if (e == &store->entries[store->count - 1]) {
-                bp_free(e->bundle_id);
-                store->count--;
-            }
-            return -1;
-        }
-        memcpy(e->data, data, len);
-    }
+    e->data = new_data;
     e->len = len;
     e->expiry = expiry;
     store->current_size += len;
@@ -152,7 +153,7 @@ int bp_store_expire(bp_store_t *store) {
     size_t removed = 0;
     
     for (size_t i = 0; i < store->count; ) {
-        if (store->entries[i].expiry < now) {
+        if (store->entries[i].expiry > 0 && store->entries[i].expiry < now) {
             store->current_size -= store->entries[i].len;
             bp_free(store->entries[i].bundle_id);
             bp_free(store->entries[i].data);
