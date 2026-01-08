@@ -249,11 +249,12 @@ static void inc32(uint8_t *block) {
     }
 }
 
-int bpsec_encrypt_aes_gcm(const uint8_t *key, const uint8_t *iv,
+int bpsec_encrypt_aes_gcm(const uint8_t *key, size_t key_len, const uint8_t *iv,
                           const uint8_t *plain, size_t plain_len,
                           const uint8_t *aad, size_t aad_len,
                           uint8_t *cipher, uint8_t *tag) {
     if (!key || !iv || !cipher || !tag) return -1;
+    if (key_len != BPSEC_AES256_KEY_LEN) return -1;
     if (plain_len > 0 && !plain) return -1;
     
     uint32_t w[60];
@@ -306,11 +307,12 @@ int bpsec_encrypt_aes_gcm(const uint8_t *key, const uint8_t *iv,
     return 0;
 }
 
-int bpsec_decrypt_aes_gcm(const uint8_t *key, const uint8_t *iv,
+int bpsec_decrypt_aes_gcm(const uint8_t *key, size_t key_len, const uint8_t *iv,
                           const uint8_t *cipher, size_t cipher_len,
                           const uint8_t *aad, size_t aad_len,
                           const uint8_t *tag, uint8_t *plain) {
     if (!key || !iv || !tag || !plain) return -1;
+    if (key_len != BPSEC_AES256_KEY_LEN) return -1;
     if (cipher_len > 0 && !cipher) return -1;
     
     uint32_t w[60];
