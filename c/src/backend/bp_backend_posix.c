@@ -2,6 +2,7 @@
 #include "bp_backend.h"
 #include "bp_bundle.h"
 #include "bp_tcpcl.h"
+#include "bp_utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -82,10 +83,15 @@ static int posix_send(const char *source_eid, const char *dest_eid, const void *
     bp_bundle_full_t bundle = {0};
     bundle.primary.version = 7;
     bundle.primary.crc_type = BP_CRC_NONE;
-    bundle.primary.lifetime_ms = ttl * 1000;
+    bundle.primary.lifetime_ms = (uint64_t)ttl * 1000;
 
-    bp_eid_parse(dest_eid, &bundle.primary.dest_scheme, bundle.primary.dest_ssp, &bundle.primary.dest_uri);
-    bp_eid_parse(source_eid, &bundle.primary.source_scheme, bundle.primary.source_ssp, &bundle.primary.source_uri);
+    if (bp_eid_parse(dest_eid, &bundle.primary.dest_scheme, bundle.primary.dest_ssp, &bundle.primary.dest_uri) < 0) {
+        return BP_ERROR_INVALID_ARGS;
+    }
+    if (bp_eid_parse(source_eid, &bundle.primary.source_scheme, bundle.primary.source_ssp, &bundle.primary.source_uri) < 0) {
+        bp_free(bundle.primary.dest_uri);
+        return BP_ERROR_INVALID_ARGS;
+    }
     bundle.primary.report_scheme = bundle.primary.source_scheme;
     bundle.primary.report_ssp[0] = bundle.primary.source_ssp[0];
     bundle.primary.report_ssp[1] = bundle.primary.source_ssp[1];
@@ -106,11 +112,32 @@ static int posix_send(const char *source_eid, const char *dest_eid, const void *
     }
 
     if (tcpcl_send_bundle(&g_session, wire, wire_len) < 0) {
-        printf("[POSIX] TCPCL send failed\n");
+        bp_free(bundle.primary.dest_uri);
+        bp_free(bundle.primary.source_uri);
+        BP_LOG_ERROR("TCPCL send failed");
         return BP_ERROR_PROTOCOL;
     }
 
-    printf("[POSIX] sent %d bytes: %s -> %s\n", wire_len, source_eid, dest_eid);
+    bp_free(bundle.primary.dest_uri);
+    bp_free(bundle.primary.source_uri);
+    BP_LOG_DEBUG("sent %d bytes: %s -> %s", wire_len, source_eid, dest_eid);
+    return BP_SUCCESS;
+}
+
+static int posix_send_raw(const void *wire_bundle, size_t wire_len) {
+    if (!wire_bundle || wire_len == 0) return BP_ERROR_INVALID_ARGS;
+    
+    if (!g_session.connected && posix_connect("127.0.0.1", 4556) < 0) {
+        BP_LOG_DEBUG("send_raw %zu bytes (no peer)", wire_len);
+        return BP_SUCCESS;
+    }
+
+    if (tcpcl_send_bundle(&g_session, wire_bundle, wire_len) < 0) {
+        BP_LOG_ERROR("TCPCL send_raw failed");
+        return BP_ERROR_PROTOCOL;
+    }
+
+    BP_LOG_DEBUG("sent_raw %zu bytes", wire_len);
     return BP_SUCCESS;
 }
 
@@ -157,19 +184,45 @@ static int posix_receive(const char *local_eid, bp_bundle_t **bundle, int timeou
     free(wire);
 
     bp_bundle_t *b = calloc(1, sizeof(bp_bundle_t));
+    if (!b) {
+        bp_bundle_full_free(&full);
+        return BP_ERROR_MEMORY;
+    }
+    
     char eid_buf[128];
     bp_eid_format(full.primary.source_scheme, full.primary.source_ssp, full.primary.source_uri, eid_buf, sizeof(eid_buf));
     b->source_eid = strdup(eid_buf);
+    if (!b->source_eid) {
+        free(b);
+        bp_bundle_full_free(&full);
+        return BP_ERROR_MEMORY;
+    }
     bp_eid_format(full.primary.dest_scheme, full.primary.dest_ssp, full.primary.dest_uri, eid_buf, sizeof(eid_buf));
     b->dest_eid = strdup(eid_buf);
-    b->payload = malloc(full.payload_len);
-    memcpy(b->payload, full.payload, full.payload_len);
+    if (!b->dest_eid) {
+        free(b->source_eid);
+        free(b);
+        bp_bundle_full_free(&full);
+        return BP_ERROR_MEMORY;
+    }
+    
+    if (full.payload_len > 0) {
+        b->payload = bp_alloc(full.payload_len);
+        if (!b->payload) {
+            free(b->source_eid);
+            free(b->dest_eid);
+            free(b);
+            bp_bundle_full_free(&full);
+            return BP_ERROR_MEMORY;
+        }
+        memcpy(b->payload, full.payload, full.payload_len);
+    }
     b->payload_len = full.payload_len;
-    b->ttl = full.primary.lifetime_ms / 1000;
+    b->ttl = (uint32_t)(full.primary.lifetime_ms / 1000);
 
     bp_bundle_full_free(&full);
     *bundle = b;
-    printf("[POSIX] received %zu bytes from %s\n", b->payload_len, b->source_eid);
+    BP_LOG_DEBUG("received %zu bytes from %s", b->payload_len, b->source_eid);
     return BP_SUCCESS;
 }
 
@@ -185,6 +238,7 @@ bp_backend_t g_posix_backend = {
     .init = posix_init,
     .shutdown = posix_shutdown,
     .send = posix_send,
+    .send_raw = posix_send_raw,
     .receive = posix_receive,
     .bundle_free = posix_bundle_free,
 };

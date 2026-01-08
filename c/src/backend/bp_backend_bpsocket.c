@@ -106,13 +106,26 @@ static int bpsocket_receive(const char *local_eid, bp_bundle_t **bundle, int tim
     }
 
     bp_bundle_t *b = calloc(1, sizeof(bp_bundle_t));
-    b->payload = malloc(n);
-    memcpy(b->payload, buffer, n);
-    b->payload_len = n;
+    if (!b) return BP_ERROR_MEMORY;
+    
+    if (n > 0) {
+        b->payload = malloc((size_t)n);
+        if (!b->payload) {
+            free(b);
+            return BP_ERROR_MEMORY;
+        }
+        memcpy(b->payload, buffer, (size_t)n);
+    }
+    b->payload_len = (size_t)n;
 
     char src_eid[64];
     snprintf(src_eid, sizeof(src_eid), "ipn:%u.%u", src_addr.bp_addr.ipn.node_id, src_addr.bp_addr.ipn.service_id);
     b->source_eid = strdup(src_eid);
+    if (!b->source_eid) {
+        free(b->payload);
+        free(b);
+        return BP_ERROR_MEMORY;
+    }
 
     *bundle = b;
     return BP_SUCCESS;
@@ -125,15 +138,22 @@ static int bpsocket_bundle_free(bp_bundle_t *bundle) {
     return BP_SUCCESS;
 }
 
+static int bpsocket_send_raw(const void *wire_bundle, size_t wire_len) {
+    (void)wire_bundle; (void)wire_len;
+    /* bpsocket operates at bundle level, raw wire send not supported */
+    return BP_ERROR_PROTOCOL;
+}
+
 bp_backend_t g_bpsocket_backend = {
     .name = "bpsocket",
     .init = bpsocket_init,
     .shutdown = bpsocket_shutdown,
     .send = bpsocket_send,
+    .send_raw = bpsocket_send_raw,
     .receive = bpsocket_receive,
     .bundle_free = bpsocket_bundle_free,
 };
 
 #else
-bp_backend_t g_bpsocket_backend = { .name = "bpsocket" };
+bp_backend_t g_bpsocket_backend = { .name = "bpsocket", .send_raw = NULL };
 #endif
