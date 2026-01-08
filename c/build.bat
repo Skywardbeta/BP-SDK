@@ -36,6 +36,14 @@ echo [6/10] Compiling BPSec...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec.c -o build/bp_bpsec.o
 if %errorlevel% neq 0 goto :error
 
+echo [6b/10] Compiling BPSec Keys...
+gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec_keys.c -o build/bp_bpsec_keys.o
+if %errorlevel% neq 0 goto :error
+
+echo [6c/10] Compiling BPSec Policy...
+gcc -I./include -Wall -Wextra -std=c11 -c src/bp_bpsec_policy.c -o build/bp_bpsec_policy.o
+if %errorlevel% neq 0 goto :error
+
 echo [7/10] Compiling Fragmentation...
 gcc -I./include -Wall -Wextra -std=c11 -c src/bp_fragment.c -o build/bp_fragment.o
 if %errorlevel% neq 0 goto :error
@@ -61,7 +69,7 @@ gcc -I./include -Wall -Wextra -std=c11 -c src/backend/bp_backend_bpsocket.c -o b
 if %errorlevel% neq 0 goto :error
 
 echo Creating Library...
-ar rcs build/libbp_sdk.a build/bp_sdk.o build/bp_utils.o build/bp_cbor.o build/bp_bundle.o build/bp_tcpcl.o build/bp_bpsec.o build/bp_fragment.o build/bp_storage.o build/bp_admin.o build/bp_stream.o build/bp_backend_posix.o build/bp_backend_bpsocket.o
+ar rcs build/libbp_sdk.a build/bp_sdk.o build/bp_utils.o build/bp_cbor.o build/bp_bundle.o build/bp_tcpcl.o build/bp_bpsec.o build/bp_bpsec_keys.o build/bp_bpsec_policy.o build/bp_fragment.o build/bp_storage.o build/bp_admin.o build/bp_stream.o build/bp_backend_posix.o build/bp_backend_bpsocket.o
 if %errorlevel% neq 0 goto :error
 
 echo.
@@ -80,6 +88,10 @@ if exist tests (
     gcc -I./include -Wall -Wextra -std=c11 tests/test_phase2.c -L./build -lbp_sdk -lws2_32 -o build/test_phase2.exe
     if %errorlevel% neq 0 echo Warning: test_phase2 build failed
 
+    echo Building test_phase3a...
+    gcc -I./include -Wall -Wextra -std=c11 tests/test_phase3a.c -L./build -lbp_sdk -lws2_32 -o build/test_phase3a.exe
+    if %errorlevel% neq 0 echo Warning: test_phase3a build failed
+
     if exist examples\test_bpsec.c (
         echo Building test_bpsec...
         gcc -I./include -Wall -Wextra -std=c11 examples/test_bpsec.c -L./build -lbp_sdk -lws2_32 -o build/test_bpsec.exe
@@ -93,6 +105,7 @@ echo.
 echo To run tests:
 echo   build\test_phase1.exe
 echo   build\test_phase2.exe
+echo   build\test_phase3a.exe
 echo   build\test_concurrency.exe
 echo   build\test_bpsec.exe
 exit /b 0
