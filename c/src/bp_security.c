@@ -3,7 +3,8 @@
  *
  * RFC 9172 order: Sign plaintext -> Encrypt (outbound), Decrypt -> Verify (inbound)
  * Keys are looked up by policy key ID first, then by EID binding.
- * Security source is set from local EID or explicit source argument.
+ * Security source: ipn: EIDs use numeric node/service; dtn: EIDs leave source_node=0
+ * so inbound key lookup falls back to the original source_eid string.
  */
 
 #include "bp_security.h"
@@ -169,15 +170,6 @@ static int parse_source_eid(const char *source, uint64_t *node, uint64_t *servic
             *service = s;
             return 0;
         }
-    } else if (strncmp(source, "dtn:", 4) == 0) {
-        const char *uri = source + 4;
-        uint64_t hash = 5381;
-        while (*uri) {
-            hash = ((hash << 5) + hash) + (uint8_t)*uri++;
-        }
-        *node = hash;
-        *service = 0;
-        return 0;
     }
     return -1;
 }
