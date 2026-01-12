@@ -15,9 +15,20 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <wincrypt.h>
+#define MUTEX_T CRITICAL_SECTION
+#define MUTEX_INIT(m) InitializeCriticalSection(&(m))
+#define MUTEX_DESTROY(m) DeleteCriticalSection(&(m))
+#define MUTEX_LOCK(m) EnterCriticalSection(&(m))
+#define MUTEX_UNLOCK(m) LeaveCriticalSection(&(m))
 #else
+#include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
+#define MUTEX_T pthread_mutex_t
+#define MUTEX_INIT(m) pthread_mutex_init(&(m), NULL)
+#define MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
+#define MUTEX_LOCK(m) pthread_mutex_lock(&(m))
+#define MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
 #endif
 
 struct bp_security_ctx {
@@ -25,6 +36,7 @@ struct bp_security_ctx {
     bpsec_policy_ctx_t *policy;
     uint64_t local_node;
     uint64_t local_service;
+    MUTEX_T mutex;
 };
 
 bp_security_ctx_t *bp_security_init(void) {
@@ -46,6 +58,7 @@ bp_security_ctx_t *bp_security_init(void) {
     
     ctx->local_node = 0;
     ctx->local_service = 0;
+    MUTEX_INIT(ctx->mutex);
     
     return ctx;
 }
@@ -54,6 +67,7 @@ void bp_security_shutdown(bp_security_ctx_t *ctx) {
     if (!ctx) return;
     bpsec_keystore_destroy(ctx->keystore);
     bpsec_policy_destroy(ctx->policy);
+    MUTEX_DESTROY(ctx->mutex);
     bp_free(ctx);
 }
 
@@ -66,10 +80,11 @@ bpsec_policy_ctx_t *bp_security_get_policy(bp_security_ctx_t *ctx) {
 }
 
 void bp_security_set_local_eid(bp_security_ctx_t *ctx, uint64_t node, uint64_t service) {
-    if (ctx) {
-        ctx->local_node = node;
-        ctx->local_service = service;
-    }
+    if (!ctx) return;
+    MUTEX_LOCK(ctx->mutex);
+    ctx->local_node = node;
+    ctx->local_service = service;
+    MUTEX_UNLOCK(ctx->mutex);
 }
 
 bp_security_status_t bp_security_add_key(bp_security_ctx_t *ctx,
@@ -135,13 +150,22 @@ static int generate_random_iv(uint8_t *iv, size_t len) {
     CryptReleaseContext(hProv, 0);
     return ok ? 0 : -1;
 #else
+    static MUTEX_T s_iv_mutex;
+    static int s_iv_init = 0;
+    static uint32_t s_iv_counter = 0;
+    
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
+        if (!s_iv_init) {
+            MUTEX_INIT(s_iv_mutex);
+            s_iv_init = 1;
+        }
         uint64_t ts = bp_time_now_dtn();
-        static uint32_t counter = 0;
+        MUTEX_LOCK(s_iv_mutex);
+        uint32_t cnt = ++s_iv_counter;
+        MUTEX_UNLOCK(s_iv_mutex);
         memcpy(iv, &ts, 8);
-        counter++;
-        memcpy(iv + 8, &counter, 4);
+        memcpy(iv + 8, &cnt, 4);
         return 0;
     }
     ssize_t n = read(fd, iv, len);
@@ -325,8 +349,11 @@ bp_security_status_t bp_security_apply(bp_security_ctx_t *ctx,
     
     if (rule.requirements == BPSEC_REQUIRE_NONE) return BP_SEC_OK;
     
+    MUTEX_LOCK(ctx->mutex);
     uint64_t sec_node = ctx->local_node;
     uint64_t sec_service = ctx->local_service;
+    MUTEX_UNLOCK(ctx->mutex);
+    
     if (source && source[0] != '\0') {
         uint64_t parsed_node, parsed_service;
         if (parse_source_eid(source, &parsed_node, &parsed_service) == 0) {

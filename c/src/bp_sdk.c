@@ -6,12 +6,27 @@
 #include "bp_backend.h"
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#define MUTEX_T CRITICAL_SECTION
+#define MUTEX_INIT(m) InitializeCriticalSection(&(m))
+#define MUTEX_DESTROY(m) DeleteCriticalSection(&(m))
+#define MUTEX_LOCK(m) EnterCriticalSection(&(m))
+#define MUTEX_UNLOCK(m) LeaveCriticalSection(&(m))
+#else
 #include <pthread.h>
+#define MUTEX_T pthread_mutex_t
+#define MUTEX_INIT(m) pthread_mutex_init(&(m), NULL)
+#define MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
+#define MUTEX_LOCK(m) pthread_mutex_lock(&(m))
+#define MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
+#endif
 
 typedef struct {
     char *node_id;
     int initialized;
-    pthread_mutex_t mutex;
+    MUTEX_T mutex;
     bp_backend_t *backend;
 } bp_context_t;
 
@@ -38,12 +53,11 @@ int bp_init(const char *node_id, const char *config_file) {
     if (!node_id) return BP_ERROR_INVALID_ARGS;
     if (g_ctx.initialized) return BP_SUCCESS;
 
-    if (pthread_mutex_init(&g_ctx.mutex, NULL) != 0)
-        return BP_ERROR_MEMORY;
+    MUTEX_INIT(g_ctx.mutex);
 
     g_ctx.node_id = strdup(node_id);
     if (!g_ctx.node_id) {
-        pthread_mutex_destroy(&g_ctx.mutex);
+        MUTEX_DESTROY(g_ctx.mutex);
         return BP_ERROR_MEMORY;
     }
 
@@ -53,7 +67,7 @@ int bp_init(const char *node_id, const char *config_file) {
         int rc = g_ctx.backend->init(config_file);
         if (rc != BP_SUCCESS) {
             free(g_ctx.node_id);
-            pthread_mutex_destroy(&g_ctx.mutex);
+            MUTEX_DESTROY(g_ctx.mutex);
             return rc;
         }
     }
@@ -65,15 +79,15 @@ int bp_init(const char *node_id, const char *config_file) {
 int bp_shutdown(void) {
     if (!g_ctx.initialized) return BP_ERROR_NOT_INITIALIZED;
 
-    pthread_mutex_lock(&g_ctx.mutex);
+    MUTEX_LOCK(g_ctx.mutex);
     if (g_ctx.backend && g_ctx.backend->shutdown)
         g_ctx.backend->shutdown();
 
     free(g_ctx.node_id);
     g_ctx.node_id = NULL;
     g_ctx.initialized = 0;
-    pthread_mutex_unlock(&g_ctx.mutex);
-    pthread_mutex_destroy(&g_ctx.mutex);
+    MUTEX_UNLOCK(g_ctx.mutex);
+    MUTEX_DESTROY(g_ctx.mutex);
     return BP_SUCCESS;
 }
 
