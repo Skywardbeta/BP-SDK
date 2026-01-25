@@ -46,7 +46,7 @@ struct bp_stream {
     size_t recv_cap;
     size_t recv_pos;
     
-    bp_fragment_ctx_t frag_ctx;
+    bp_fragment_ctx_t *frag_ctx;
     
     uint64_t transfer_id;
     size_t in_flight;
@@ -91,13 +91,20 @@ bp_stream_t *bp_stream_create(const char *local_eid, const char *remote_eid,
     s->recv_buf = bp_alloc(s->recv_cap);
     if (!s->recv_buf) goto fail;
     
-    bp_fragment_ctx_init_with_timeout(&s->frag_ctx, s->config.timeout_ms);
+    bp_fragment_config_t frag_cfg = {
+        .timeout_ms = s->config.timeout_ms,
+        .max_entries = BP_FRAGMENT_DEFAULT_MAX_ENTRIES,
+        .max_total_bytes = BP_FRAGMENT_DEFAULT_MAX_BYTES
+    };
+    s->frag_ctx = bp_fragment_ctx_create(&frag_cfg);
+    if (!s->frag_ctx) goto fail;
     
     MUTEX_INIT(s->mutex);
     
     return s;
 
 fail:
+    bp_fragment_ctx_destroy(s->frag_ctx);
     bp_free(s->local_eid);
     bp_free(s->remote_eid);
     bp_free(s->send_buf);
@@ -115,7 +122,7 @@ void bp_stream_destroy(bp_stream_t *stream) {
     
     MUTEX_DESTROY(stream->mutex);
     
-    bp_fragment_ctx_free(&stream->frag_ctx);
+    bp_fragment_ctx_destroy(stream->frag_ctx);
     bp_free(stream->local_eid);
     bp_free(stream->remote_eid);
     bp_free(stream->send_buf);
@@ -262,7 +269,7 @@ int bp_stream_feed(bp_stream_t *stream, const void *bundle_data, size_t bundle_l
     MUTEX_LOCK(stream->mutex);
     
     bp_bundle_full_t complete;
-    int rc = bp_fragment_add(&stream->frag_ctx, &decoded, &complete);
+    int rc = bp_fragment_add(stream->frag_ctx, &decoded, &complete);
     
     if (rc == 1) {
         if (stream->recv_len + complete.payload_len > stream->recv_cap) {
@@ -380,7 +387,7 @@ int bp_stream_is_complete(bp_stream_t *stream) {
     
     MUTEX_LOCK(stream->mutex);
     int has_data = (stream->recv_len > stream->recv_pos);
-    int no_pending = (bp_fragment_pending_count(&stream->frag_ctx) == 0);
+    int no_pending = (bp_fragment_pending_count(stream->frag_ctx) == 0);
     MUTEX_UNLOCK(stream->mutex);
     
     /* Returns true only when data is available AND no fragments pending.
