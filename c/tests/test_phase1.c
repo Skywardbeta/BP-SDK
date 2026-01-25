@@ -446,14 +446,14 @@ TEST(fragment_reassembly) {
     ASSERT_EQ(rc, 0);
     ASSERT(frag_count > 1);
     
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t complete;
     int is_complete = 0;
     
     for (size_t i = 0; i < frag_count; i++) {
-        rc = bp_fragment_add(&ctx, &frags[i], &complete);
+        rc = bp_fragment_add(ctx, &frags[i], &complete);
         ASSERT(rc >= 0);
         if (rc == 1) {
             is_complete = 1;
@@ -472,7 +472,7 @@ TEST(fragment_reassembly) {
     bp_free(complete.primary.report_uri);
     bp_free(payload);
     bp_fragment_free_array(frags, frag_count);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     
     PASS();
 }
@@ -508,15 +508,15 @@ TEST(fragment_out_of_order) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(frag_count, 4);
     
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t complete;
     size_t order[] = {2, 0, 3, 1};
     int is_complete = 0;
     
     for (size_t i = 0; i < frag_count; i++) {
-        rc = bp_fragment_add(&ctx, &frags[order[i]], &complete);
+        rc = bp_fragment_add(ctx, &frags[order[i]], &complete);
         ASSERT(rc >= 0);
         if (rc == 1) {
             is_complete = 1;
@@ -533,7 +533,7 @@ TEST(fragment_out_of_order) {
     bp_free(complete.primary.report_uri);
     bp_free(payload);
     bp_fragment_free_array(frags, frag_count);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     
     PASS();
 }

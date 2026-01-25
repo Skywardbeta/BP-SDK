@@ -1,307 +1,354 @@
 /*
- * test_security.c - Tests for high-level security API
+ * test_security.c - Security hardening tests
+ * Tests CRC validation, fragment limits, security pipeline, and transport.
  */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "bp_security.h"
 #include "bp_bundle.h"
+#include "bp_fragment.h"
+#include "bp_security.h"
+#include "bp_bpsec.h"
+#include "bp_utils.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
-static int tests_run = 0;
 static int tests_passed = 0;
+static int tests_failed = 0;
 
 #define TEST(name) static void test_##name(void)
 #define RUN_TEST(name) do { \
-    printf("  %-50s ", #name); \
+    printf("  %-50s", #name); \
     test_##name(); \
-    tests_run++; \
 } while(0)
-#define PASS() do { tests_passed++; printf("OK\n"); return; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define ASSERT(cond) do { if (!(cond)) FAIL(#cond); } while(0)
-#define ASSERT_EQ(a, b) do { if ((a) != (b)) FAIL(#a " != " #b); } while(0)
 
-TEST(init_shutdown) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    ASSERT(bp_security_get_keystore(ctx) != NULL);
-    ASSERT(bp_security_get_policy(ctx) != NULL);
-    
-    bp_security_shutdown(ctx);
-    PASS();
-}
+#define ASSERT(cond) do { \
+    if (!(cond)) { \
+        printf("FAIL\n    %s at %s:%d\n", #cond, __FILE__, __LINE__); \
+        tests_failed++; \
+        return; \
+    } \
+} while(0)
 
-TEST(add_key) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    uint8_t key[32] = {0};
-    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
-    
-    bp_security_status_t st = bp_security_add_key(ctx, "test-key", "ipn:1.*",
-                                                   key, sizeof(key), BPSEC_KEY_TYPE_HMAC);
-    ASSERT_EQ(st, BP_SEC_OK);
-    
-    bpsec_key_entry_t entry;
-    int rc = bpsec_keystore_get(bp_security_get_keystore(ctx), "test-key", &entry);
-    ASSERT_EQ(rc, 0);
-    ASSERT_EQ(entry.data_len, 32);
-    
-    bp_security_shutdown(ctx);
-    PASS();
-}
+#define PASS() do { printf("OK\n"); tests_passed++; } while(0)
 
-TEST(add_rule) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    bp_security_status_t st = bp_security_add_rule(ctx, "ipn:1.*", BPSEC_REQUIRE_SIGN, 10);
-    ASSERT_EQ(st, BP_SEC_OK);
-    
-    bpsec_policy_rule_t rule;
-    int rc = bpsec_policy_lookup(bp_security_get_policy(ctx), "ipn:1.1", &rule);
-    ASSERT_EQ(rc, 0);
-    ASSERT_EQ(rule.requirements, BPSEC_REQUIRE_SIGN);
-    
-    bp_security_shutdown(ctx);
-    PASS();
-}
-
-TEST(apply_sign) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    uint8_t key[32] = {0};
-    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
-    bp_security_add_key(ctx, "hmac-key", "ipn:1.1", key, sizeof(key), BPSEC_KEY_TYPE_HMAC);
-    bp_security_add_rule(ctx, "ipn:1.*", BPSEC_REQUIRE_SIGN, 10);
-    
+TEST(crc_valid_bundle_decodes) {
     bp_bundle_full_t bundle = {0};
     bundle.primary.version = 7;
+    bundle.primary.crc_type = BP_CRC_16;
     bundle.primary.dest_scheme = BP_EID_IPN;
-    bundle.primary.dest_ssp[0] = 1;
+    bundle.primary.dest_ssp[0] = 2;
     bundle.primary.dest_ssp[1] = 1;
     bundle.primary.source_scheme = BP_EID_IPN;
-    bundle.primary.source_ssp[0] = 2;
+    bundle.primary.source_ssp[0] = 1;
     bundle.primary.source_ssp[1] = 1;
+    bundle.primary.report_scheme = BP_EID_IPN;
+    bundle.primary.lifetime_ms = 3600000;
     
-    uint8_t payload[] = "Test payload data";
-    bundle.payload = malloc(sizeof(payload));
-    memcpy(bundle.payload, payload, sizeof(payload));
-    bundle.payload_len = sizeof(payload);
+    uint8_t payload[] = "Test payload";
+    bundle.payload = payload;
+    bundle.payload_len = sizeof(payload) - 1;
     
-    bp_security_status_t st = bp_security_apply(ctx, &bundle, "ipn:2.1");
-    ASSERT_EQ(st, BP_SEC_OK);
-    ASSERT_EQ(bundle.block_count, 1);
-    ASSERT_EQ(bundle.blocks[0].type, BP_BLOCK_BIB);
+    uint8_t wire[512];
+    int wire_len = bp_bundle_encode(&bundle, wire, sizeof(wire));
+    ASSERT(wire_len > 0);
     
-    free(bundle.payload);
-    free(bundle.blocks[0].data);
-    free(bundle.blocks);
-    bp_security_shutdown(ctx);
+    bp_bundle_full_t decoded = {0};
+    int rc = bp_bundle_decode(wire, (size_t)wire_len, &decoded);
+    ASSERT(rc == 0);
+    ASSERT(decoded.payload_len == bundle.payload_len);
+    
+    bp_bundle_full_free(&decoded);
     PASS();
 }
 
-TEST(apply_encrypt) {
-    bp_security_ctx_t *ctx = bp_security_init();
+TEST(crc_corrupted_primary_rejected) {
+    bp_bundle_full_t bundle = {0};
+    bundle.primary.version = 7;
+    bundle.primary.crc_type = BP_CRC_16;
+    bundle.primary.dest_scheme = BP_EID_IPN;
+    bundle.primary.dest_ssp[0] = 2;
+    bundle.primary.dest_ssp[1] = 1;
+    bundle.primary.source_scheme = BP_EID_IPN;
+    bundle.primary.source_ssp[0] = 1;
+    bundle.primary.source_ssp[1] = 1;
+    bundle.primary.report_scheme = BP_EID_IPN;
+    bundle.primary.lifetime_ms = 3600000;
+    
+    uint8_t wire[512];
+    int wire_len = bp_bundle_encode(&bundle, wire, sizeof(wire));
+    ASSERT(wire_len > 0);
+    
+    wire[10] ^= 0xFF;
+    
+    bp_bundle_full_t decoded = {0};
+    int rc = bp_bundle_decode(wire, (size_t)wire_len, &decoded);
+    ASSERT(rc != 0);
+    
+    PASS();
+}
+
+TEST(fragment_limit_max_entries) {
+    bp_fragment_config_t cfg = {
+        .timeout_ms = 60000,
+        .max_entries = 2,
+        .max_total_bytes = 1024 * 1024
+    };
+    
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create(&cfg);
     ASSERT(ctx != NULL);
     
-    uint8_t key[32] = {0};
-    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0x10);
-    bp_security_add_key(ctx, "aes-key", "ipn:2.1", key, sizeof(key), BPSEC_KEY_TYPE_AES);
-    bp_security_add_rule(ctx, "ipn:2.*", BPSEC_REQUIRE_ENCRYPT, 10);
+    bp_bundle_full_t frag1 = {0};
+    frag1.primary.flags = BP_FLAG_FRAGMENT;
+    frag1.primary.creation_ts = 1000;
+    frag1.primary.creation_seq = 1;
+    frag1.primary.total_adu_len = 100;
+    frag1.primary.fragment_offset = 0;
+    uint8_t data1[50] = {0};
+    frag1.payload = data1;
+    frag1.payload_len = 50;
+    
+    bp_bundle_full_t frag2 = {0};
+    frag2.primary.flags = BP_FLAG_FRAGMENT;
+    frag2.primary.creation_ts = 2000;
+    frag2.primary.creation_seq = 2;
+    frag2.primary.total_adu_len = 100;
+    frag2.primary.fragment_offset = 0;
+    uint8_t data2[50] = {0};
+    frag2.payload = data2;
+    frag2.payload_len = 50;
+    
+    bp_bundle_full_t frag3 = {0};
+    frag3.primary.flags = BP_FLAG_FRAGMENT;
+    frag3.primary.creation_ts = 3000;
+    frag3.primary.creation_seq = 3;
+    frag3.primary.total_adu_len = 100;
+    frag3.primary.fragment_offset = 0;
+    uint8_t data3[50] = {0};
+    frag3.payload = data3;
+    frag3.payload_len = 50;
+    
+    bp_bundle_full_t complete = {0};
+    
+    int rc1 = bp_fragment_add(ctx, &frag1, &complete);
+    ASSERT(rc1 == BP_FRAGMENT_OK);
+    
+    int rc2 = bp_fragment_add(ctx, &frag2, &complete);
+    ASSERT(rc2 == BP_FRAGMENT_OK);
+    
+    int rc3 = bp_fragment_add(ctx, &frag3, &complete);
+    ASSERT(rc3 == BP_FRAGMENT_ERR_LIMIT);
+    
+    bp_fragment_ctx_destroy(ctx);
+    PASS();
+}
+
+TEST(fragment_limit_max_bytes) {
+    bp_fragment_config_t cfg = {
+        .timeout_ms = 60000,
+        .max_entries = 100,
+        .max_total_bytes = 200
+    };
+    
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create(&cfg);
+    ASSERT(ctx != NULL);
+    
+    bp_bundle_full_t frag1 = {0};
+    frag1.primary.flags = BP_FLAG_FRAGMENT;
+    frag1.primary.creation_ts = 1000;
+    frag1.primary.creation_seq = 1;
+    frag1.primary.total_adu_len = 150;
+    frag1.primary.fragment_offset = 0;
+    uint8_t data1[50] = {0};
+    frag1.payload = data1;
+    frag1.payload_len = 50;
+    
+    bp_bundle_full_t frag2 = {0};
+    frag2.primary.flags = BP_FLAG_FRAGMENT;
+    frag2.primary.creation_ts = 2000;
+    frag2.primary.creation_seq = 2;
+    frag2.primary.total_adu_len = 150;
+    frag2.primary.fragment_offset = 0;
+    uint8_t data2[50] = {0};
+    frag2.payload = data2;
+    frag2.payload_len = 50;
+    
+    bp_bundle_full_t complete = {0};
+    
+    int rc1 = bp_fragment_add(ctx, &frag1, &complete);
+    ASSERT(rc1 == BP_FRAGMENT_OK);
+    
+    int rc2 = bp_fragment_add(ctx, &frag2, &complete);
+    ASSERT(rc2 == BP_FRAGMENT_ERR_LIMIT);
+    
+    bp_fragment_ctx_destroy(ctx);
+    PASS();
+}
+
+TEST(security_ctx_create_destroy) {
+    bp_security_ctx_t *ctx = bp_security_ctx_create();
+    ASSERT(ctx != NULL);
+    
+    bpsec_keystore_t *ks = bp_security_get_keystore(ctx);
+    ASSERT(ks != NULL);
+    
+    bpsec_policy_ctx_t *pol = bp_security_get_policy(ctx);
+    ASSERT(pol != NULL);
+    
+    bp_security_ctx_destroy(ctx);
+    PASS();
+}
+
+TEST(security_add_bib) {
+    bp_security_ctx_t *ctx = bp_security_ctx_create();
+    ASSERT(ctx != NULL);
+    
+    bp_security_set_local_eid(ctx, "ipn:1.1");
+    
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    
+    bpsec_keystore_t *ks = bp_security_get_keystore(ctx);
+    int rc = bpsec_keystore_add(ks, "test-key", BPSEC_KEY_TYPE_HMAC, key, 32, NULL, 0);
+    ASSERT(rc == 0);
     
     bp_bundle_full_t bundle = {0};
     bundle.primary.version = 7;
     bundle.primary.dest_scheme = BP_EID_IPN;
     bundle.primary.dest_ssp[0] = 2;
     bundle.primary.dest_ssp[1] = 1;
-    
-    uint8_t payload[] = "Secret payload data";
-    bundle.payload = malloc(sizeof(payload));
+    uint8_t payload[] = "Test payload data";
+    bundle.payload = bp_alloc(sizeof(payload));
     memcpy(bundle.payload, payload, sizeof(payload));
     bundle.payload_len = sizeof(payload);
     
-    bp_security_status_t st = bp_security_apply(ctx, &bundle, "ipn:1.1");
-    ASSERT_EQ(st, BP_SEC_OK);
-    ASSERT_EQ(bundle.block_count, 1);
-    ASSERT_EQ(bundle.blocks[0].type, BP_BLOCK_BCB);
+    rc = bp_security_add_bib(ctx, &bundle, 1, "test-key");
+    ASSERT(rc == BP_SEC_OK);
+    ASSERT(bundle.block_count == 1);
+    ASSERT(bundle.blocks[0].type == BP_BLOCK_BIB);
+    
+    bp_free(bundle.payload);
+    bp_free(bundle.blocks[0].data);
+    bp_free(bundle.blocks);
+    bp_security_ctx_destroy(ctx);
+    PASS();
+}
+
+TEST(security_add_bcb) {
+    bp_security_ctx_t *ctx = bp_security_ctx_create();
+    ASSERT(ctx != NULL);
+    
+    bp_security_set_local_eid(ctx, "ipn:1.1");
+    
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    
+    bpsec_keystore_t *ks = bp_security_get_keystore(ctx);
+    int rc = bpsec_keystore_add(ks, "aes-key", BPSEC_KEY_TYPE_AES, key, 32, NULL, 0);
+    ASSERT(rc == 0);
+    
+    bp_bundle_full_t bundle = {0};
+    bundle.primary.version = 7;
+    bundle.primary.dest_scheme = BP_EID_IPN;
+    bundle.primary.dest_ssp[0] = 2;
+    bundle.primary.dest_ssp[1] = 1;
+    uint8_t payload[] = "Secret payload data";
+    bundle.payload = bp_alloc(sizeof(payload));
+    memcpy(bundle.payload, payload, sizeof(payload));
+    bundle.payload_len = sizeof(payload);
+    
+    rc = bp_security_add_bcb(ctx, &bundle, 1, "aes-key");
+    ASSERT(rc == BP_SEC_OK);
+    ASSERT(bundle.block_count == 1);
+    ASSERT(bundle.blocks[0].type == BP_BLOCK_BCB);
     ASSERT(memcmp(bundle.payload, payload, sizeof(payload)) != 0);
     
-    free(bundle.payload);
-    free(bundle.blocks[0].data);
-    free(bundle.blocks);
-    bp_security_shutdown(ctx);
+    bp_free(bundle.payload);
+    bp_free(bundle.blocks[0].data);
+    bp_free(bundle.blocks);
+    bp_security_ctx_destroy(ctx);
     PASS();
 }
 
-TEST(process_verify) {
-    bp_security_ctx_t *ctx = bp_security_init();
+TEST(security_policy_apply) {
+    bp_security_ctx_t *ctx = bp_security_ctx_create();
     ASSERT(ctx != NULL);
     
-    uint8_t key[32] = {0};
+    bp_security_set_local_eid(ctx, "ipn:1.1");
+    
+    uint8_t key[32];
     for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
-    /* Key bound to dest for apply, and source for process */
-    bp_security_add_key(ctx, "hmac-key", "ipn:1.1", key, sizeof(key), BPSEC_KEY_TYPE_HMAC);
-    bp_security_add_key(ctx, "hmac-key-src", "ipn:2.1", key, sizeof(key), BPSEC_KEY_TYPE_HMAC);
-    bp_security_add_rule(ctx, "ipn:1.*", BPSEC_REQUIRE_SIGN, 10);
+    
+    bpsec_keystore_t *ks = bp_security_get_keystore(ctx);
+    bpsec_keystore_add(ks, "sign-key", BPSEC_KEY_TYPE_HMAC, key, 32, "ipn:2.1", 0);
+    
+    bpsec_policy_rule_t rule = {0};
+    strcpy(rule.dest_pattern, "ipn:2.*");
+    rule.requirements = BPSEC_REQUIRE_SIGN;
+    rule.role = BPSEC_ROLE_SOURCE;
+    strcpy(rule.sign_key_id, "sign-key");
+    rule.priority = 10;
+    
+    bpsec_policy_ctx_t *pol = bp_security_get_policy(ctx);
+    bpsec_policy_add_rule(pol, &rule);
     
     bp_bundle_full_t bundle = {0};
     bundle.primary.version = 7;
     bundle.primary.dest_scheme = BP_EID_IPN;
-    bundle.primary.dest_ssp[0] = 1;
+    bundle.primary.dest_ssp[0] = 2;
     bundle.primary.dest_ssp[1] = 1;
-    bundle.primary.source_scheme = BP_EID_IPN;
-    bundle.primary.source_ssp[0] = 2;
-    bundle.primary.source_ssp[1] = 1;
-    
-    uint8_t payload[] = "Test payload";
-    bundle.payload = malloc(sizeof(payload));
+    uint8_t payload[] = "Policy test payload";
+    bundle.payload = bp_alloc(sizeof(payload));
     memcpy(bundle.payload, payload, sizeof(payload));
     bundle.payload_len = sizeof(payload);
     
-    bp_security_apply(ctx, &bundle, "ipn:2.1");
+    int rc = bp_security_apply(ctx, &bundle);
+    ASSERT(rc == BP_SEC_OK);
+    ASSERT(bundle.block_count == 1);
+    ASSERT(bundle.blocks[0].type == BP_BLOCK_BIB);
     
-    bp_security_result_t result;
-    bp_security_status_t st = bp_security_process(ctx, &bundle, &result);
-    ASSERT_EQ(st, BP_SEC_OK);
-    ASSERT_EQ(result.bib_verified, 1);
-    
-    free(bundle.payload);
-    free(bundle.blocks[0].data);
-    free(bundle.blocks);
-    bp_security_shutdown(ctx);
+    bp_free(bundle.payload);
+    bp_free(bundle.blocks[0].data);
+    bp_free(bundle.blocks);
+    bp_security_ctx_destroy(ctx);
     PASS();
 }
 
-TEST(process_decrypt) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    uint8_t key[32] = {0};
-    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0x20);
-    /* Key bound to dest for apply, and security source for process */
-    bp_security_add_key(ctx, "aes-key", "ipn:3.1", key, sizeof(key), BPSEC_KEY_TYPE_AES);
-    bp_security_add_key(ctx, "aes-key-src", "ipn:4.1", key, sizeof(key), BPSEC_KEY_TYPE_AES);
-    bp_security_add_rule(ctx, "ipn:3.*", BPSEC_REQUIRE_ENCRYPT, 10);
-    
-    bp_bundle_full_t bundle = {0};
-    bundle.primary.version = 7;
-    bundle.primary.dest_scheme = BP_EID_IPN;
-    bundle.primary.dest_ssp[0] = 3;
-    bundle.primary.dest_ssp[1] = 1;
-    bundle.primary.source_scheme = BP_EID_IPN;
-    bundle.primary.source_ssp[0] = 4;
-    bundle.primary.source_ssp[1] = 1;
-    
-    uint8_t payload[] = "Secret message here";
-    bundle.payload = malloc(sizeof(payload));
-    memcpy(bundle.payload, payload, sizeof(payload));
-    bundle.payload_len = sizeof(payload);
-    
-    /* Apply with security source matching key binding */
-    bp_security_apply(ctx, &bundle, "ipn:4.1");
-    
-    bp_security_result_t result;
-    bp_security_status_t st = bp_security_process(ctx, &bundle, &result);
-    ASSERT_EQ(st, BP_SEC_OK);
-    ASSERT_EQ(result.bcb_decrypted, 1);
-    ASSERT(memcmp(bundle.payload, payload, sizeof(payload)) == 0);
-    
-    free(bundle.payload);
-    free(bundle.blocks[0].data);
-    free(bundle.blocks);
-    bp_security_shutdown(ctx);
-    PASS();
-}
-
-TEST(no_policy_no_security) {
-    bp_security_ctx_t *ctx = bp_security_init();
+TEST(security_no_key_error) {
+    bp_security_ctx_t *ctx = bp_security_ctx_create();
     ASSERT(ctx != NULL);
     
     bp_bundle_full_t bundle = {0};
     bundle.primary.version = 7;
-    bundle.primary.dest_scheme = BP_EID_IPN;
-    bundle.primary.dest_ssp[0] = 99;
-    bundle.primary.dest_ssp[1] = 1;
-    
-    uint8_t payload[] = "No security needed";
-    bundle.payload = malloc(sizeof(payload));
-    memcpy(bundle.payload, payload, sizeof(payload));
-    bundle.payload_len = sizeof(payload);
-    
-    bp_security_status_t st = bp_security_apply(ctx, &bundle, "ipn:1.1");
-    ASSERT_EQ(st, BP_SEC_OK);
-    ASSERT_EQ(bundle.block_count, 0);
-    
-    free(bundle.payload);
-    bp_security_shutdown(ctx);
-    PASS();
-}
-
-TEST(missing_key_error) {
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT(ctx != NULL);
-    
-    bp_security_add_rule(ctx, "ipn:5.*", BPSEC_REQUIRE_SIGN, 10);
-    
-    bp_bundle_full_t bundle = {0};
-    bundle.primary.version = 7;
-    bundle.primary.dest_scheme = BP_EID_IPN;
-    bundle.primary.dest_ssp[0] = 5;
-    bundle.primary.dest_ssp[1] = 1;
-    
     uint8_t payload[] = "Test";
-    bundle.payload = malloc(sizeof(payload));
-    memcpy(bundle.payload, payload, sizeof(payload));
+    bundle.payload = payload;
     bundle.payload_len = sizeof(payload);
     
-    bp_security_status_t st = bp_security_apply(ctx, &bundle, "ipn:1.1");
-    ASSERT_EQ(st, BP_SEC_ERR_NO_KEY);
+    int rc = bp_security_add_bib(ctx, &bundle, 1, "nonexistent-key");
+    ASSERT(rc == BP_SEC_ERR_NO_KEY);
     
-    free(bundle.payload);
-    bp_security_shutdown(ctx);
-    PASS();
-}
-
-TEST(null_params) {
-    ASSERT_EQ(bp_security_apply(NULL, NULL, NULL), BP_SEC_ERR_INVALID);
-    
-    bp_security_ctx_t *ctx = bp_security_init();
-    ASSERT_EQ(bp_security_apply(ctx, NULL, NULL), BP_SEC_ERR_INVALID);
-    ASSERT_EQ(bp_security_add_key(ctx, NULL, NULL, NULL, 0, 0), BP_SEC_ERR_INVALID);
-    ASSERT_EQ(bp_security_add_rule(ctx, NULL, 0, 0), BP_SEC_ERR_INVALID);
-    
-    bp_security_shutdown(ctx);
-    bp_security_shutdown(NULL);
+    bp_security_ctx_destroy(ctx);
     PASS();
 }
 
 int main(void) {
-    printf("\n=== Security API Test Suite ===\n\n");
+    printf("\n=== Security Hardening Test Suite ===\n\n");
     
-    printf("Initialization:\n");
-    RUN_TEST(init_shutdown);
-    RUN_TEST(add_key);
-    RUN_TEST(add_rule);
+    printf("CRC Validation Tests:\n");
+    RUN_TEST(crc_valid_bundle_decodes);
+    RUN_TEST(crc_corrupted_primary_rejected);
     
-    printf("\nApply Security:\n");
-    RUN_TEST(apply_sign);
-    RUN_TEST(apply_encrypt);
+    printf("\nFragment Limit Tests:\n");
+    RUN_TEST(fragment_limit_max_entries);
+    RUN_TEST(fragment_limit_max_bytes);
     
-    printf("\nProcess Security:\n");
-    RUN_TEST(process_verify);
-    RUN_TEST(process_decrypt);
+    printf("\nSecurity Pipeline Tests:\n");
+    RUN_TEST(security_ctx_create_destroy);
+    RUN_TEST(security_add_bib);
+    RUN_TEST(security_add_bcb);
+    RUN_TEST(security_policy_apply);
+    RUN_TEST(security_no_key_error);
     
-    printf("\nEdge Cases:\n");
-    RUN_TEST(no_policy_no_security);
-    RUN_TEST(missing_key_error);
-    RUN_TEST(null_params);
+    printf("\n=== Results: %d passed, %d failed ===\n\n", tests_passed, tests_failed);
     
-    printf("\n=== Results: %d passed, %d failed ===\n\n", 
-           tests_passed, tests_run - tests_passed);
-    
-    return (tests_passed == tests_run) ? 0 : 1;
+    return tests_failed > 0 ? 1 : 0;
 }
+

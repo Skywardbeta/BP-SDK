@@ -43,21 +43,22 @@ static int tests_failed = 0;
 #define PASS() do { printf("OK\n"); tests_passed++; } while(0)
 
 TEST(fragment_expiry_init) {
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
-    ASSERT_EQ(ctx.default_timeout_ms, BP_FRAGMENT_DEFAULT_TIMEOUT_MS);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
+    bp_fragment_ctx_destroy(ctx);
     
-    bp_fragment_ctx_init_with_timeout(&ctx, 60000);
-    ASSERT_EQ(ctx.default_timeout_ms, 60000);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_config_t cfg = {60000, BP_FRAGMENT_DEFAULT_MAX_ENTRIES, BP_FRAGMENT_DEFAULT_MAX_BYTES};
+    ctx = bp_fragment_ctx_create(&cfg);
+    ASSERT(ctx != NULL);
+    bp_fragment_ctx_destroy(ctx);
     
     PASS();
 }
 
 TEST(fragment_expiry_basic) {
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init_with_timeout(&ctx, 100);
+    bp_fragment_config_t cfg = {100, BP_FRAGMENT_DEFAULT_MAX_ENTRIES, BP_FRAGMENT_DEFAULT_MAX_BYTES};
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create(&cfg);
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t frag1;
     memset(&frag1, 0, sizeof(frag1));
@@ -75,22 +76,22 @@ TEST(fragment_expiry_basic) {
     frag1.payload_len = 100;
     
     bp_bundle_full_t complete;
-    int rc = bp_fragment_add(&ctx, &frag1, &complete);
+    int rc = bp_fragment_add(ctx, &frag1, &complete);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(bp_fragment_pending_count(&ctx), 1);
+    ASSERT_EQ(bp_fragment_pending_count(ctx), 1);
     
     uint64_t now = (uint64_t)time(NULL) * 1000;
-    size_t expired = bp_fragment_expire(&ctx, now + 200);
+    size_t expired = bp_fragment_expire(ctx, now + 200);
     ASSERT_EQ(expired, 1);
-    ASSERT_EQ(bp_fragment_pending_count(&ctx), 0);
+    ASSERT_EQ(bp_fragment_pending_count(ctx), 0);
     
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     PASS();
 }
 
 TEST(fragment_pending_bytes) {
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t frag1;
     memset(&frag1, 0, sizeof(frag1));
@@ -107,11 +108,11 @@ TEST(fragment_pending_bytes) {
     frag1.payload_len = 500;
     
     bp_bundle_full_t complete;
-    bp_fragment_add(&ctx, &frag1, &complete);
+    bp_fragment_add(ctx, &frag1, &complete);
     
-    ASSERT_EQ(bp_fragment_pending_bytes(&ctx), 1000);
+    ASSERT_EQ(bp_fragment_pending_bytes(ctx), 1000);
     
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     PASS();
 }
 
@@ -329,14 +330,14 @@ TEST(large_fragment_reassembly) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(frag_count, 10);
     
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t complete;
     int is_complete = 0;
     
     for (size_t i = 0; i < frag_count; i++) {
-        rc = bp_fragment_add(&ctx, &frags[i], &complete);
+        rc = bp_fragment_add(ctx, &frags[i], &complete);
         ASSERT(rc >= 0);
         if (rc == 1) is_complete = 1;
     }
@@ -351,7 +352,7 @@ TEST(large_fragment_reassembly) {
     bp_free(complete.primary.report_uri);
     bp_free(original);
     bp_fragment_free_array(frags, frag_count);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     
     PASS();
 }
@@ -425,8 +426,9 @@ TEST(multiple_concurrent_streams) {
 }
 
 TEST(fragment_loss_timeout) {
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init_with_timeout(&ctx, 50);
+    bp_fragment_config_t cfg = {50, BP_FRAGMENT_DEFAULT_MAX_ENTRIES, BP_FRAGMENT_DEFAULT_MAX_BYTES};
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create(&cfg);
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t frag1, frag2;
     memset(&frag1, 0, sizeof(frag1));
@@ -446,9 +448,9 @@ TEST(fragment_loss_timeout) {
     frag1.payload_len = 100;
     
     bp_bundle_full_t complete;
-    int rc = bp_fragment_add(&ctx, &frag1, &complete);
+    int rc = bp_fragment_add(ctx, &frag1, &complete);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(bp_fragment_pending_count(&ctx), 1);
+    ASSERT_EQ(bp_fragment_pending_count(ctx), 1);
     
     frag2.primary.version = 7;
     frag2.primary.flags = BP_FLAG_FRAGMENT;
@@ -463,16 +465,16 @@ TEST(fragment_loss_timeout) {
     frag2.payload = data2;
     frag2.payload_len = 100;
     
-    rc = bp_fragment_add(&ctx, &frag2, &complete);
+    rc = bp_fragment_add(ctx, &frag2, &complete);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(bp_fragment_pending_count(&ctx), 1);
+    ASSERT_EQ(bp_fragment_pending_count(ctx), 1);
     
     uint64_t now = (uint64_t)time(NULL) * 1000;
-    size_t expired = bp_fragment_expire(&ctx, now + 100);
+    size_t expired = bp_fragment_expire(ctx, now + 100);
     ASSERT_EQ(expired, 1);
-    ASSERT_EQ(bp_fragment_pending_count(&ctx), 0);
+    ASSERT_EQ(bp_fragment_pending_count(ctx), 0);
     
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     PASS();
 }
 
@@ -507,14 +509,14 @@ TEST(large_data_10mb) {
     ASSERT_EQ(rc, 0);
     ASSERT(frag_count > 100);
     
-    bp_fragment_ctx_t ctx;
-    bp_fragment_ctx_init(&ctx);
+    bp_fragment_ctx_t *ctx = bp_fragment_ctx_create_default();
+    ASSERT(ctx != NULL);
     
     bp_bundle_full_t complete;
     int is_complete = 0;
     
     for (size_t i = 0; i < frag_count; i++) {
-        rc = bp_fragment_add(&ctx, &frags[i], &complete);
+        rc = bp_fragment_add(ctx, &frags[i], &complete);
         ASSERT(rc >= 0);
         if (rc == 1) is_complete = 1;
     }
@@ -534,7 +536,7 @@ TEST(large_data_10mb) {
     bp_free(complete.primary.report_uri);
     bp_free(original);
     bp_fragment_free_array(frags, frag_count);
-    bp_fragment_ctx_free(&ctx);
+    bp_fragment_ctx_destroy(ctx);
     
     PASS();
 }

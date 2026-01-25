@@ -31,7 +31,7 @@ endif
 
 # Core library sources
 SRCS = bp_sdk.c bp_utils.c bp_cbor.c bp_bundle.c bp_tcpcl.c \
-       bp_bpsec.c bp_bpsec_keys.c bp_bpsec_policy.c \
+       bp_bpsec.c bp_bpsec_keys.c bp_bpsec_policy.c bp_security.c \
        bp_fragment.c bp_storage.c bp_admin.c bp_stream.c
 
 BACKEND_SRCS = bp_backend_posix.c bp_backend_bpsocket.c
@@ -39,7 +39,7 @@ BACKEND_SRCS = bp_backend_posix.c bp_backend_bpsocket.c
 OBJS = $(SRCS:%.c=$(BUILD)/%.o) $(BACKEND_SRCS:%.c=$(BUILD)/%.o)
 
 # Test executables  
-TESTS = test_phase1 test_phase2 test_phase3a test_concurrency
+TESTS = test_phase1 test_phase2 test_phase3a test_concurrency test_security
 TEST_BINS = $(TESTS:%=$(BUILD)/%$(EXE))
 
 .PHONY: all lib tests test clean debug help
