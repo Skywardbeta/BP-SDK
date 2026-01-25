@@ -1,4 +1,7 @@
-/* bp_tcpcl.c - TCPCLv4 (RFC 9174) */
+/*
+ * bp_tcpcl.c - TCPCLv4 (RFC 9174)
+ * Includes socket timeouts and stricter frame validation.
+ */
 #include "bp_tcpcl.h"
 #include "bp_utils.h"
 #include <string.h>
@@ -12,6 +15,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
 #endif
 
 static const uint8_t TCPCL_MAGIC[4] = {'d', 't', 'n', '!'};
@@ -19,13 +24,37 @@ static const uint8_t TCPCL_MAGIC[4] = {'d', 't', 'n', '!'};
 #define TCPCL_MAX_NODE_ID_LEN   1024
 #define TCPCL_MAX_SEGMENT_SIZE  (16 * 1024 * 1024)
 #define TCPCL_MAX_TRANSFER_SIZE (256 * 1024 * 1024)
+#define TCPCL_DEFAULT_TIMEOUT_MS 30000
+
+static int set_socket_timeout(int fd, int timeout_ms) {
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+    return 0;
+}
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t sent = 0;
     while (sent < len) {
         ssize_t n = send(fd, (const char*)(buf + sent), (int)(len - sent), 0);
-        if (n <= 0) return -1;
-        sent += n;
+        if (n < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAETIMEDOUT) return -2;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+#endif
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += (size_t)n;
     }
     return 0;
 }
@@ -34,8 +63,16 @@ static int read_all(int fd, uint8_t *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
         ssize_t n = recv(fd, (char*)(buf + got), (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += n;
+        if (n < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAETIMEDOUT) return -2;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+#endif
+            return -1;
+        }
+        if (n == 0) return -1;
+        got += (size_t)n;
     }
     return 0;
 }
@@ -119,10 +156,12 @@ int tcpcl_recv_sess_init(tcpcl_session_t *sess) {
 }
 
 int tcpcl_send_bundle(tcpcl_session_t *sess, const uint8_t *data, size_t len) {
-    if (!sess->connected) return -1;
+    if (!sess || !sess->connected || !data || len == 0) return -1;
+    if (len > sess->transfer_mru) return -1;
 
     uint64_t transfer_id = sess->next_transfer_id++;
     size_t offset = 0;
+    int rc;
 
     while (offset < len) {
         size_t chunk = len - offset;
@@ -138,53 +177,75 @@ int tcpcl_send_bundle(tcpcl_session_t *sess, const uint8_t *data, size_t len) {
         encode_uint64(hdr + 2, transfer_id);
         encode_uint64(hdr + 10, chunk);
 
-        if (write_all(sess->fd, hdr, 18) < 0) return -1;
-        if (write_all(sess->fd, data + offset, chunk) < 0) return -1;
+        rc = write_all(sess->fd, hdr, 18);
+        if (rc < 0) return rc;
+        rc = write_all(sess->fd, data + offset, chunk);
+        if (rc < 0) return rc;
         offset += chunk;
     }
 
     uint8_t ack[18];
-    if (read_all(sess->fd, ack, 18) < 0) return -1;
+    rc = read_all(sess->fd, ack, 18);
+    if (rc < 0) return rc;
+    if (ack[0] == TCPCL_MSG_SESS_TERM) {
+        sess->connected = 0;
+        return -1;
+    }
     if (ack[0] != TCPCL_MSG_XFER_ACK) return -1;
     return 0;
 }
 
 int tcpcl_recv_bundle(tcpcl_session_t *sess, uint8_t **data, size_t *len) {
-    if (!sess->connected) return -1;
+    if (!sess || !sess->connected || !data || !len) return -1;
 
     uint8_t *buf = NULL;
     size_t buf_len = 0;
     uint64_t expected_tid = 0;
     int first_segment = 1;
     int done = 0;
+    int rc;
 
     while (!done) {
         uint8_t hdr[18];
-        if (read_all(sess->fd, hdr, 18) < 0) { bp_free(buf); return -1; }
-        if (hdr[0] != TCPCL_MSG_XFER_SEG) { bp_free(buf); return -1; }
+        rc = read_all(sess->fd, hdr, 18);
+        if (rc < 0) { bp_free(buf); return rc; }
+
+        uint8_t msg_type = hdr[0];
+        if (msg_type == TCPCL_MSG_SESS_TERM) {
+            bp_free(buf);
+            sess->connected = 0;
+            return -1;
+        }
+        if (msg_type == TCPCL_MSG_KEEPALIVE) {
+            continue;
+        }
+        if (msg_type != TCPCL_MSG_XFER_SEG) { bp_free(buf); return -1; }
 
         uint8_t flags = hdr[1];
         uint64_t tid = decode_uint64(hdr + 2);
         uint64_t seg_len = decode_uint64(hdr + 10);
 
-        /* Validate transfer_id consistency across segments */
         if (first_segment) {
+            if (!(flags & TCPCL_SEG_START)) { bp_free(buf); return -1; }
             expected_tid = tid;
             first_segment = 0;
-        } else if (tid != expected_tid) {
-            bp_free(buf);
-            return -1;
+        } else {
+            if (flags & TCPCL_SEG_START) { bp_free(buf); return -1; }
+            if (tid != expected_tid) { bp_free(buf); return -1; }
         }
 
         if (seg_len > TCPCL_MAX_SEGMENT_SIZE) { bp_free(buf); return -1; }
         if (buf_len + seg_len > TCPCL_MAX_TRANSFER_SIZE) { bp_free(buf); return -1; }
+        if (seg_len > sess->segment_mru) { bp_free(buf); return -1; }
 
         uint8_t *new_buf = bp_realloc(buf, buf_len + (size_t)seg_len);
         if (!new_buf) { bp_free(buf); return -1; }
         buf = new_buf;
 
-        if (read_all(sess->fd, buf + buf_len, (size_t)seg_len) < 0) { bp_free(buf); return -1; }
+        rc = read_all(sess->fd, buf + buf_len, (size_t)seg_len);
+        if (rc < 0) { bp_free(buf); return rc; }
         buf_len += (size_t)seg_len;
+
         if (flags & TCPCL_SEG_END) done = 1;
     }
 
@@ -195,7 +256,8 @@ int tcpcl_recv_bundle(tcpcl_session_t *sess, uint8_t **data, size_t *len) {
     encode_uint64(ack + 10, buf_len);
     write_all(sess->fd, ack, 18);
 
-    *data = buf; *len = buf_len;
+    *data = buf;
+    *len = buf_len;
     return 0;
 }
 
@@ -206,6 +268,7 @@ int tcpcl_session_init(tcpcl_session_t *sess, int fd) {
     sess->segment_mru = 65536;
     sess->transfer_mru = 1024 * 1024;
     sess->next_transfer_id = 1;
+    set_socket_timeout(fd, TCPCL_DEFAULT_TIMEOUT_MS);
     return 0;
 }
 
