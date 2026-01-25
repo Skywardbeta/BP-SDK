@@ -12,15 +12,42 @@
 #include <ws2tcpip.h>
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <errno.h>
 #endif
 
 static tcpcl_session_t g_session = {0};
 static int g_listen_fd = -1;
 static char g_local_node[64] = {0};
+
+static int wait_for_read(int fd, int timeout_ms) {
+    if (timeout_ms <= 0) return 1;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+    return (ret > 0) ? 1 : 0;
+}
+
+static void set_socket_recv_timeout(int fd, int timeout_ms) {
+    if (timeout_ms <= 0) return;
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
 
 static int posix_init(const char *config) {
     (void)config;
@@ -102,11 +129,15 @@ static int posix_send(const char *source_eid, const char *dest_eid, const void *
     uint8_t wire[65536];
     int wire_len = bp_bundle_encode(&bundle, wire, sizeof(wire));
     if (wire_len < 0) {
+        bp_free(bundle.primary.dest_uri);
+        bp_free(bundle.primary.source_uri);
         printf("[POSIX] Bundle encode failed\n");
         return BP_ERROR_PROTOCOL;
     }
 
     if (!g_session.connected && posix_connect("127.0.0.1", 4556) < 0) {
+        bp_free(bundle.primary.dest_uri);
+        bp_free(bundle.primary.source_uri);
         printf("[POSIX] send %zu bytes (no peer): %s -> %s\n", payload_len, source_eid, dest_eid);
         return BP_SUCCESS;
     }
@@ -142,8 +173,6 @@ static int posix_send_raw(const void *wire_bundle, size_t wire_len) {
 }
 
 static int posix_receive(const char *local_eid, bp_bundle_t **bundle, int timeout_ms) {
-    (void)timeout_ms;
-
     if (!g_session.connected) {
         if (g_listen_fd < 0) {
             g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -162,17 +191,26 @@ static int posix_receive(const char *local_eid, bp_bundle_t **bundle, int timeou
             strncpy(g_local_node, local_eid, sizeof(g_local_node) - 1);
         }
 
+        if (timeout_ms > 0 && !wait_for_read(g_listen_fd, timeout_ms)) {
+            return BP_ERROR_TIMEOUT;
+        }
+
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
         int client_fd = accept(g_listen_fd, (struct sockaddr*)&peer, &peer_len);
         if (client_fd < 0) return BP_ERROR_TIMEOUT;
 
+        set_socket_recv_timeout(client_fd, timeout_ms);
         tcpcl_session_init(&g_session, client_fd);
         tcpcl_recv_contact_header(client_fd);
         tcpcl_send_contact_header(client_fd);
         tcpcl_recv_sess_init(&g_session);
         tcpcl_send_sess_init(&g_session);
         g_session.connected = 1;
+    }
+
+    if (timeout_ms > 0 && !wait_for_read(g_session.fd, timeout_ms)) {
+        return BP_ERROR_TIMEOUT;
     }
 
     uint8_t *wire = NULL;
@@ -189,15 +227,23 @@ static int posix_receive(const char *local_eid, bp_bundle_t **bundle, int timeou
         return BP_ERROR_MEMORY;
     }
     
-    char eid_buf[128];
-    bp_eid_format(full.primary.source_scheme, full.primary.source_ssp, full.primary.source_uri, eid_buf, sizeof(eid_buf));
+    char eid_buf[128] = {0};
+    if (bp_eid_format(full.primary.source_scheme, full.primary.source_ssp, 
+                      full.primary.source_uri, eid_buf, sizeof(eid_buf)) < 0) {
+        strncpy(eid_buf, "dtn:none", sizeof(eid_buf) - 1);
+    }
     b->source_eid = strdup(eid_buf);
     if (!b->source_eid) {
         free(b);
         bp_bundle_full_free(&full);
         return BP_ERROR_MEMORY;
     }
-    bp_eid_format(full.primary.dest_scheme, full.primary.dest_ssp, full.primary.dest_uri, eid_buf, sizeof(eid_buf));
+    
+    eid_buf[0] = '\0';
+    if (bp_eid_format(full.primary.dest_scheme, full.primary.dest_ssp, 
+                      full.primary.dest_uri, eid_buf, sizeof(eid_buf)) < 0) {
+        strncpy(eid_buf, "dtn:none", sizeof(eid_buf) - 1);
+    }
     b->dest_eid = strdup(eid_buf);
     if (!b->dest_eid) {
         free(b->source_eid);
