@@ -62,12 +62,12 @@ static void install_keys(void) {
     bpsec_keystore_t *ks = bpsdk_default_keystore();
     bpsec_keystore_add(ks, KEY_BCB, BPSEC_KEY_TYPE_AES,  aes_key,  sizeof(aes_key),  NULL, 0);
     bpsec_keystore_add(ks, KEY_BIB, BPSEC_KEY_TYPE_HMAC, hmac_key, sizeof(hmac_key), NULL, 0);
+    uint64_t now_s = bp_time_now_dtn();
     bpsec_keystore_add(ks, KEY_BCB_EXPIRED, BPSEC_KEY_TYPE_AES,
                        aes_key, sizeof(aes_key), NULL,
-                       bp_time_now_dtn() > 100 ? bp_time_now_dtn() - 100 : 1);
+                       now_s > 100 ? now_s - 100 : 1);
     bpsec_keystore_add(ks, KEY_BCB_SHORT_EXPIRY, BPSEC_KEY_TYPE_AES,
-                       aes_key, sizeof(aes_key), NULL,
-                       bp_time_now_dtn() * 1000ULL + 100);
+                       aes_key, sizeof(aes_key), NULL, now_s + 1);
 }
 
 static int policy_bcb_only(bp_security_policy_t *p, const char *key) {
@@ -360,6 +360,24 @@ TEST(concurrent_send_safe) {
     PASS();
 }
 
+TEST(reject_empty_payload) {
+    bp_session_t *s = bp_session_open("empty");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"x", 0,
+                                       &opts, &wire, &wire_len),
+              BPSEC_ERR_INVALID_POLICY);
+    ASSERT(wire == NULL);
+    bp_session_close(s);
+    PASS();
+}
+
 TEST(missing_source_rejected) {
     bp_session_t *s = bp_session_open("no-source");
     ASSERT(s);
@@ -404,6 +422,394 @@ TEST(opts_source_overrides_session) {
     PASS();
 }
 
+/* --- file provider parsing --- */
+
+static char *write_temp_file(const char *body) {
+    static char path[256];
+#ifdef _WIN32
+    char dir[256];
+    DWORD n = GetTempPathA(sizeof(dir), dir);
+    if (n == 0 || n >= sizeof(dir)) return NULL;
+    snprintf(path, sizeof(path), "%sbp_kp_%lu.txt", dir, (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(path, sizeof(path), "/tmp/bp_kp_%d.txt", (int)getpid());
+#endif
+    FILE *fp = fopen(path, "w");
+    if (!fp) return NULL;
+    fputs(body, fp);
+    fclose(fp);
+    return path;
+}
+
+TEST(file_provider_parses_hmac_and_aes) {
+    const char *body =
+        "# comment line\n"
+        "k_hmac hmac 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        "k_aes  aes  fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\n";
+    char *path = write_temp_file(body);
+    ASSERT(path);
+
+    bp_key_provider_file_t *fp = bp_key_provider_file_create(path);
+    ASSERT(fp);
+    bp_key_provider_t prov = bp_key_provider_file_make(fp);
+
+    uint8_t buf[32]; size_t blen = 0;
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_hmac", BP_KEY_USAGE_HMAC), 0);
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_hmac", BP_KEY_USAGE_AES),  -1);
+    ASSERT_EQ(prov.get_key(prov.provider_ctx, "k_hmac", BP_KEY_USAGE_HMAC,
+                           buf, sizeof(buf), &blen), 0);
+    ASSERT_EQ(blen, 32);
+
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_aes", BP_KEY_USAGE_AES),  0);
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_aes", BP_KEY_USAGE_HMAC), -1);
+    ASSERT_EQ(prov.get_key(prov.provider_ctx, "k_aes", BP_KEY_USAGE_AES,
+                           buf, sizeof(buf), &blen), 0);
+    ASSERT_EQ(blen, 32);
+
+    bp_key_provider_file_destroy(fp);
+    remove(path);
+    PASS();
+}
+
+TEST(file_provider_rejects_missing_type_token) {
+    const char *body =
+        "k_x 0123456789abcdef0123456789abcdef\n";
+    char *path = write_temp_file(body);
+    ASSERT(path);
+
+    bp_key_provider_file_t *fp = bp_key_provider_file_create(path);
+    ASSERT(fp);
+    bp_key_provider_t prov = bp_key_provider_file_make(fp);
+
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_x", BP_KEY_USAGE_HMAC), -1);
+    ASSERT_EQ(prov.key_available(prov.provider_ctx, "k_x", BP_KEY_USAGE_AES),  -1);
+
+    bp_key_provider_file_destroy(fp);
+    remove(path);
+    PASS();
+}
+
+/* --- IV state provider --- */
+
+typedef struct {
+    int      have_state;
+    uint8_t  salt[8];
+    uint64_t counter;
+    int      load_calls;
+    int      save_calls;
+} ivstate_t;
+
+static int ivstate_load(void *ctx, const char *name, uint8_t salt[8], uint64_t *counter) {
+    (void)name;
+    ivstate_t *st = ctx;
+    st->load_calls++;
+    if (!st->have_state) return -1;
+    memcpy(salt, st->salt, 8);
+    *counter = st->counter;
+    return 0;
+}
+static int ivstate_save(void *ctx, const char *name, const uint8_t salt[8], uint64_t counter) {
+    (void)name;
+    ivstate_t *st = ctx;
+    st->save_calls++;
+    memcpy(st->salt, salt, 8);
+    st->counter = counter;
+    st->have_state = 1;
+    return 0;
+}
+
+TEST(iv_provider_load_after_set_security) {
+    bp_session_t *s = bp_session_open("ivp-after");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    ivstate_t st = {0};
+    st.have_state = 1;
+    for (int i = 0; i < 8; i++) st.salt[i] = (uint8_t)(0xA0 + i);
+    st.counter = 12345;
+
+    bp_iv_state_provider_t prov = { .load = ivstate_load, .save = ivstate_save, .ctx = &st };
+    ASSERT_EQ(bp_session_set_iv_state_provider(s, &prov), BPSEC_SUCCESS);
+    ASSERT_EQ(st.load_calls, 1);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"x", 1,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+
+    bp_session_stats_t stats;
+    bp_session_get_stats(s, &stats);
+    ASSERT_EQ(stats.iv_counter, (uint64_t)12346);
+    ASSERT_EQ(st.save_calls, 1);
+    ASSERT_EQ(st.counter, (uint64_t)12346);
+
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
+TEST(iv_provider_rejects_overflow_counter) {
+    bp_session_t *s = bp_session_open("ivp-overflow");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    ivstate_t st = {0};
+    st.have_state = 1;
+    st.counter = 0x100000000ULL;
+    bp_iv_state_provider_t prov = { .load = ivstate_load, .save = ivstate_save, .ctx = &st };
+    ASSERT_EQ(bp_session_set_iv_state_provider(s, &prov), BPSEC_ERR_IV_EXHAUSTED);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"x", 1,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+    ASSERT(wire);
+    bp_free(wire);
+
+    bp_session_close(s);
+    PASS();
+}
+
+/* --- malformed ASB rejection --- */
+
+/*
+ * Locate the BCB ASB params triple in the wire.
+ *
+ * The ASB content emitted by build_bcb_asb is:
+ *   array(6) array(1) uint(payload=1) uint(ctx_id=2) uint(ctx_flags=1)
+ *   <security_source_eid> array(3)
+ *     array(2) uint(1) <bstr IV>           // IV pair
+ *     array(2) uint(2) uint(3)             // variant pair
+ *     array(2) uint(4) uint(0)             // scope pair
+ *   array(1) array(1) array(2) uint(1) <bstr tag>
+ *
+ * `0x86 0x81 0x01 0x02 0x01` is unique to the ASB body. From there the
+ * security source EID is variable-length, but the next `0x83` (params
+ * array of 3) marks the start of the params block. After that:
+ *   IV pair    starts at  +0  (variable length, contains a bstr)
+ *   variant    starts at  +len(IV pair)
+ *   scope      starts immediately after variant (always 3 bytes)
+ *
+ * For the patch tests we just scan forward from the ASB-body signature
+ * to the literal variant pair `0x82 0x02 0x03` or scope pair
+ * `0x82 0x04 0x00` and flip the pid byte. Because the search starts
+ * inside the ASB body, the patch cannot land on a coincidental match
+ * elsewhere in the bundle.
+ */
+static const uint8_t BCB_ASB_BODY_SIG[5] = {0x86, 0x81, 0x01, 0x02, 0x01};
+
+static int find_asb_body(const uint8_t *wire, size_t wire_len, size_t *out_off) {
+    for (size_t i = 0; i + sizeof(BCB_ASB_BODY_SIG) <= wire_len; i++) {
+        if (memcmp(wire + i, BCB_ASB_BODY_SIG, sizeof(BCB_ASB_BODY_SIG)) == 0) {
+            *out_off = i + sizeof(BCB_ASB_BODY_SIG);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int patch_param_pid(uint8_t *wire, size_t wire_len,
+                           const uint8_t pair[3], uint8_t new_pid) {
+    size_t off = 0;
+    if (!find_asb_body(wire, wire_len, &off)) return 0;
+    for (size_t i = off; i + 3 <= wire_len; i++) {
+        if (wire[i] == pair[0] && wire[i+1] == pair[1] && wire[i+2] == pair[2]) {
+            wire[i+1] = new_pid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(asb_rejects_missing_variant) {
+    bp_session_t *s = bp_session_open("asb-no-var");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"hello", 5,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+
+    uint8_t variant_pair[3] = {0x82, 0x02, 0x03};
+    ASSERT(patch_param_pid(wire, wire_len, variant_pair, 0x09));
+
+    bp_bundle_t *out = NULL;
+    ASSERT_EQ(bp_session_process_wire(s, wire, wire_len, &out), BPSEC_ERR_DECRYPT);
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
+TEST(asb_rejects_missing_scope) {
+    bp_session_t *s = bp_session_open("asb-no-scope");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"hello", 5,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+
+    uint8_t scope_pair[3] = {0x82, 0x04, 0x00};
+    ASSERT(patch_param_pid(wire, wire_len, scope_pair, 0x09));
+
+    bp_bundle_t *out = NULL;
+    ASSERT_EQ(bp_session_process_wire(s, wire, wire_len, &out), BPSEC_ERR_DECRYPT);
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
+/*
+ * BCB ASB content layout (Phase 1 emitter):
+ *   array(6) array(1) uint(payload=1) uint(ctx_id=2) uint(ctx_flags=1) ...
+ * Bytes: 0x86 0x81 0x01 0x02 0x01 ...
+ * That signature is unique to the ASB body; patching offset 4 changes
+ * ctx_flags from 1 to anything else without disturbing the BCB block
+ * header, where similar small ints appear as block number / flags.
+ */
+TEST(asb_rejects_extra_ctx_flags) {
+    bp_session_t *s = bp_session_open("asb-ctx-flags");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"hi", 2,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+
+    int patched = 0;
+    for (size_t i = 0; i + 5 <= wire_len; i++) {
+        if (wire[i] == 0x86 && wire[i+1] == 0x81 && wire[i+2] == 0x01
+            && wire[i+3] == 0x02 && wire[i+4] == 0x01) {
+            wire[i+4] = 0x03;
+            patched = 1;
+            break;
+        }
+    }
+    ASSERT(patched);
+
+    bp_bundle_t *out = NULL;
+    ASSERT_EQ(bp_session_process_wire(s, wire, wire_len, &out), BPSEC_ERR_DECRYPT);
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
+TEST(asb_rejects_mismatched_variant) {
+    bp_session_t *s = bp_session_open("asb-variant");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+    bp_security_policy_t p;
+    policy_bcb_only(&p, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &p), BPSEC_SUCCESS);
+
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"hello", 5,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+
+    size_t off = 0;
+    ASSERT(find_asb_body(wire, wire_len, &off));
+    int patched = 0;
+    for (size_t i = off; i + 3 <= wire_len; i++) {
+        if (wire[i] == 0x82 && wire[i+1] == 0x02 && wire[i+2] == 0x03) {
+            wire[i+2] = 0x05;
+            patched = 1;
+            break;
+        }
+    }
+    ASSERT(patched);
+
+    bp_bundle_t *out = NULL;
+    ASSERT_EQ(bp_session_process_wire(s, wire, wire_len, &out), BPSEC_ERR_DECRYPT);
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
+/*
+ * Concurrent set_security: spawn N threads, each retries set_security
+ * many times, alternating between a known-good policy and a policy
+ * whose key was never installed. The good calls must always leave the
+ * session armed; the bad calls must never tear it down. After joining
+ * we verify a final secure_encode still works.
+ */
+typedef struct {
+    bp_session_t *session;
+    int           iters;
+    int           good_failures;
+} concurrent_setsec_arg_t;
+
+static thread_ret_t concurrent_setsec_thread(void *arg) {
+    concurrent_setsec_arg_t *a = arg;
+    bp_security_policy_t good, bad;
+    policy_bcb_only(&good, KEY_BCB);
+    policy_bcb_only(&bad,  "unknown-key-id");
+    for (int i = 0; i < a->iters; i++) {
+        if ((i & 1) == 0) {
+            if (bp_session_set_security(a->session, &good) != BPSEC_SUCCESS)
+                a->good_failures++;
+        } else {
+            (void)bp_session_set_security(a->session, &bad);
+        }
+    }
+    return (thread_ret_t)0;
+}
+
+TEST(concurrent_set_security_atomic) {
+    bp_session_t *s = bp_session_open("setsec-race");
+    ASSERT(s);
+    bp_session_set_source(s, "ipn:1.1");
+
+    bp_security_policy_t init;
+    policy_bcb_only(&init, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &init), BPSEC_SUCCESS);
+
+    enum { N = 4, ITER = 200 };
+    THREAD_T threads[N];
+    concurrent_setsec_arg_t args[N];
+    for (int i = 0; i < N; i++) {
+        args[i].session = s;
+        args[i].iters = ITER;
+        args[i].good_failures = 0;
+        THREAD_CREATE(threads[i], concurrent_setsec_thread, &args[i]);
+    }
+    int total_failures = 0;
+    for (int i = 0; i < N; i++) { THREAD_JOIN(threads[i]); total_failures += args[i].good_failures; }
+    ASSERT_EQ(total_failures, 0);
+
+    bp_security_policy_t good;
+    policy_bcb_only(&good, KEY_BCB);
+    ASSERT_EQ(bp_session_set_security(s, &good), BPSEC_SUCCESS);
+    bp_delivery_opts_t opts = { .dest_eid = "ipn:2.1", .lifetime_ms = 60000 };
+    uint8_t *wire = NULL; size_t wire_len = 0;
+    ASSERT_EQ(bp_session_secure_encode(s, (const uint8_t *)"x", 1,
+                                       &opts, &wire, &wire_len), BPSEC_SUCCESS);
+    bp_bundle_t *out = NULL;
+    ASSERT_EQ(bp_session_process_wire(s, wire, wire_len, &out), BPSEC_SUCCESS);
+    bp_bundle_free(out);
+    bp_free(wire);
+    bp_session_close(s);
+    PASS();
+}
+
 int main(void) {
     if (bp_init("ipn:1.0", NULL) != BP_SUCCESS) {
         fprintf(stderr, "bp_init failed\n");
@@ -423,6 +829,16 @@ int main(void) {
     RUN_TEST(bib_tamper_detected);
     RUN_TEST(bcb_tamper_detected);
     RUN_TEST(iv_counter_monotonic_unique);
+    RUN_TEST(reject_empty_payload);
+    RUN_TEST(file_provider_parses_hmac_and_aes);
+    RUN_TEST(file_provider_rejects_missing_type_token);
+    RUN_TEST(iv_provider_load_after_set_security);
+    RUN_TEST(iv_provider_rejects_overflow_counter);
+    RUN_TEST(asb_rejects_mismatched_variant);
+    RUN_TEST(asb_rejects_missing_variant);
+    RUN_TEST(asb_rejects_missing_scope);
+    RUN_TEST(asb_rejects_extra_ctx_flags);
+    RUN_TEST(concurrent_set_security_atomic);
     RUN_TEST(missing_source_rejected);
     RUN_TEST(opts_source_overrides_session);
     RUN_TEST(concurrent_send_safe);
