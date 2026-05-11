@@ -215,46 +215,50 @@ static void free_cached_ctx_locked(bp_session_t *s) {
     s->aes_gcm_ctx = NULL;
 }
 
-static int init_hmac_ctx_locked(bp_session_t *s) {
+static int init_hmac_ctx_into(bpsec_context_id_t ctx_id, const char *key_ref,
+                               void **out_ctx) {
+    *out_ctx = NULL;
     const bp_key_provider_t *kp = bpsdk_get_key_provider();
     const bp_crypto_backend_t *be = bpsdk_get_crypto_backend();
     if (!kp || !be) return BPSEC_ERR_INTERNAL;
 
     int variant; size_t tag_len;
-    if (hmac_variant(s->policy.bib_context, &variant, &tag_len) < 0)
+    if (hmac_variant(ctx_id, &variant, &tag_len) < 0)
         return BPSEC_ERR_INVALID_CONTEXT;
 
-    if (kp->key_available(kp->provider_ctx, s->bib_key_ref, BP_KEY_USAGE_HMAC) != 0)
+    if (kp->key_available(kp->provider_ctx, key_ref, BP_KEY_USAGE_HMAC) != 0)
         return BPSEC_ERR_KEY_NOT_AVAILABLE;
 
     uint8_t key[BP_KEY_PROVIDER_MAX_KEY_LEN];
     size_t key_len = 0;
-    if (kp->get_key(kp->provider_ctx, s->bib_key_ref,
+    if (kp->get_key(kp->provider_ctx, key_ref,
                     BP_KEY_USAGE_HMAC, key, sizeof(key), &key_len) != 0) {
         return BPSEC_ERR_KEY_NOT_AVAILABLE;
     }
 
-    int rc = be->hmac_init(be->backend_ctx, key, key_len, variant, &s->hmac_ctx);
+    int rc = be->hmac_init(be->backend_ctx, key, key_len, variant, out_ctx);
     memset(key, 0, sizeof(key));
-    if (rc != 0) { s->hmac_ctx = NULL; return BPSEC_ERR_CRYPTO_FAILURE; }
+    if (rc != 0) { *out_ctx = NULL; return BPSEC_ERR_CRYPTO_FAILURE; }
     return BPSEC_SUCCESS;
 }
 
-static int init_aes_gcm_ctx_locked(bp_session_t *s) {
+static int init_aes_gcm_ctx_into(bpsec_context_id_t ctx_id, const char *key_ref,
+                                  void **out_ctx) {
+    *out_ctx = NULL;
     const bp_key_provider_t *kp = bpsdk_get_key_provider();
     const bp_crypto_backend_t *be = bpsdk_get_crypto_backend();
     if (!kp || !be) return BPSEC_ERR_INTERNAL;
 
     int variant; size_t want_key_len;
-    if (aes_variant(s->policy.bcb_context, &variant, &want_key_len) < 0)
+    if (aes_variant(ctx_id, &variant, &want_key_len) < 0)
         return BPSEC_ERR_INVALID_CONTEXT;
 
-    if (kp->key_available(kp->provider_ctx, s->bcb_key_ref, BP_KEY_USAGE_AES) != 0)
+    if (kp->key_available(kp->provider_ctx, key_ref, BP_KEY_USAGE_AES) != 0)
         return BPSEC_ERR_KEY_NOT_AVAILABLE;
 
     uint8_t key[BP_KEY_PROVIDER_MAX_KEY_LEN];
     size_t key_len = 0;
-    if (kp->get_key(kp->provider_ctx, s->bcb_key_ref,
+    if (kp->get_key(kp->provider_ctx, key_ref,
                     BP_KEY_USAGE_AES, key, sizeof(key), &key_len) != 0) {
         return BPSEC_ERR_KEY_NOT_AVAILABLE;
     }
@@ -263,10 +267,17 @@ static int init_aes_gcm_ctx_locked(bp_session_t *s) {
         return BPSEC_ERR_INVALID_POLICY;
     }
 
-    int rc = be->aes_gcm_init(be->backend_ctx, key, key_len, variant, &s->aes_gcm_ctx);
+    int rc = be->aes_gcm_init(be->backend_ctx, key, key_len, variant, out_ctx);
     memset(key, 0, sizeof(key));
-    if (rc != 0) { s->aes_gcm_ctx = NULL; return BPSEC_ERR_CRYPTO_FAILURE; }
+    if (rc != 0) { *out_ctx = NULL; return BPSEC_ERR_CRYPTO_FAILURE; }
     return BPSEC_SUCCESS;
+}
+
+static void free_ctx_pair(void *hmac_ctx, void *aes_ctx) {
+    const bp_crypto_backend_t *be = bpsdk_get_crypto_backend();
+    if (!be) return;
+    if (hmac_ctx && be->hmac_free) be->hmac_free(be->backend_ctx, hmac_ctx);
+    if (aes_ctx && be->aes_gcm_free) be->aes_gcm_free(be->backend_ctx, aes_ctx);
 }
 
 static int parse_eid_into(const char *eid,
@@ -328,96 +339,167 @@ int bp_session_set_source(bp_session_t *s, const char *source_eid) {
     return BPSEC_SUCCESS;
 }
 
+/*
+ * Resolve persisted IV state into locals so the caller can commit them
+ * atomically. *applied is set to 1 when the provider returned a usable
+ * (salt, counter) pair; 0 means "no prior state", in which case the
+ * caller should keep its current values. Refuses persisted counters
+ * that would overflow the 32-bit IV counter slot and silently wrap.
+ */
+static int resolve_iv_state(const bp_session_t *s,
+                            uint8_t out_salt[BPSEC_IV_SALT_LEN],
+                            uint32_t *out_counter, int *applied) {
+    *applied = 0;
+    if (!s->iv_state_set) return BPSEC_SUCCESS;
+
+    uint8_t persisted_salt[BPSEC_IV_SALT_LEN] = {0};
+    uint64_t persisted_counter = 0;
+    if (s->iv_state.load(s->iv_state.ctx, s->name,
+                         persisted_salt, &persisted_counter) != 0) {
+        return BPSEC_SUCCESS;
+    }
+    if (persisted_counter > 0xFFFFFFFFULL) return BPSEC_ERR_IV_EXHAUSTED;
+
+    int empty = 1;
+    for (size_t i = 0; i < sizeof(persisted_salt); i++) {
+        if (persisted_salt[i]) { empty = 0; break; }
+    }
+    if (empty) memcpy(out_salt, s->iv_salt, BPSEC_IV_SALT_LEN);
+    else       memcpy(out_salt, persisted_salt, BPSEC_IV_SALT_LEN);
+    *out_counter = (uint32_t)persisted_counter;
+    *applied = 1;
+    return BPSEC_SUCCESS;
+}
+
 int bp_session_set_iv_state_provider(bp_session_t *s,
                                      const bp_iv_state_provider_t *provider) {
     if (!s) return BPSEC_ERR_INVALID_POLICY;
     if (provider && (!provider->load || !provider->save)) return BPSEC_ERR_INVALID_POLICY;
 
     mutex_lock(&s->mutex);
-    if (provider) {
-        s->iv_state = *provider;
-        s->iv_state_set = 1;
-    } else {
-        memset(&s->iv_state, 0, sizeof(s->iv_state));
-        s->iv_state_set = 0;
+
+    bp_session_t probe = *s;
+    if (provider) { probe.iv_state = *provider; probe.iv_state_set = 1; }
+    else          { memset(&probe.iv_state, 0, sizeof(probe.iv_state));
+                    probe.iv_state_set = 0; }
+
+    uint8_t  new_salt[BPSEC_IV_SALT_LEN];
+    uint32_t new_counter = 0;
+    int      applied = 0;
+    int rc = BPSEC_SUCCESS;
+    if (probe.iv_state_set && s->policy_set) {
+        rc = resolve_iv_state(&probe, new_salt, &new_counter, &applied);
+    }
+    if (rc != BPSEC_SUCCESS) { mutex_unlock(&s->mutex); return rc; }
+
+    if (provider) { s->iv_state = *provider; s->iv_state_set = 1; }
+    else          { memset(&s->iv_state, 0, sizeof(s->iv_state));
+                    s->iv_state_set = 0; }
+    if (applied) {
+        memcpy(s->iv_salt, new_salt, sizeof(new_salt));
+        s->iv_counter = new_counter;
     }
     mutex_unlock(&s->mutex);
     return BPSEC_SUCCESS;
 }
 
+/*
+ * Atomic set_security:
+ *   Build the new policy, key refs, crypto contexts, key-expiry snapshot,
+ *   and resolved IV state into locals. Take the session mutex once and
+ *   commit them as a single transaction. On any failure: free the locals
+ *   and return. The session's previous state (policy / contexts / IV) is
+ *   left untouched, so a failing set_security on a previously-armed
+ *   session does NOT disarm it. This contract is required for safe
+ *   concurrent calls from multiple threads.
+ *
+ *   Note: this function does not take the mutex while calling the key
+ *   provider or crypto backend; both are documented as thread-safe and
+ *   the operation is read-only on those globals.
+ */
 int bp_session_set_security(bp_session_t *s, const bp_security_policy_t *policy) {
     if (!s || !policy) return BPSEC_ERR_INVALID_POLICY;
     int rc = validate_policy(policy);
     if (rc != BPSEC_SUCCESS) return rc;
 
-    mutex_lock(&s->mutex);
-
-    free_cached_ctx_locked(s);
-    memset(s->bib_key_ref, 0, sizeof(s->bib_key_ref));
-    memset(s->bcb_key_ref, 0, sizeof(s->bcb_key_ref));
-    s->policy = *policy;
+    bp_security_policy_t new_policy = *policy;
+    char new_bib_key_ref[BP_SESSION_KEYREF_MAX] = {0};
+    char new_bcb_key_ref[BP_SESSION_KEYREF_MAX] = {0};
     if (policy->bib_key_ref) {
-        strncpy(s->bib_key_ref, policy->bib_key_ref, sizeof(s->bib_key_ref) - 1);
-        s->policy.bib_key_ref = s->bib_key_ref;
+        strncpy(new_bib_key_ref, policy->bib_key_ref, sizeof(new_bib_key_ref) - 1);
+        new_policy.bib_key_ref = new_bib_key_ref;
     }
     if (policy->bcb_key_ref) {
-        strncpy(s->bcb_key_ref, policy->bcb_key_ref, sizeof(s->bcb_key_ref) - 1);
-        s->policy.bcb_key_ref = s->bcb_key_ref;
+        strncpy(new_bcb_key_ref, policy->bcb_key_ref, sizeof(new_bcb_key_ref) - 1);
+        new_policy.bcb_key_ref = new_bcb_key_ref;
     }
 
-    if (policy_uses_bib(policy)) {
-        rc = init_hmac_ctx_locked(s);
-        if (rc != BPSEC_SUCCESS) goto out;
+    void *new_hmac_ctx = NULL;
+    void *new_aes_ctx  = NULL;
+    if (policy_uses_bib(&new_policy)) {
+        rc = init_hmac_ctx_into(new_policy.bib_context, new_bib_key_ref, &new_hmac_ctx);
+        if (rc != BPSEC_SUCCESS) goto fail;
     }
-    if (policy_uses_bcb(policy)) {
-        rc = init_aes_gcm_ctx_locked(s);
-        if (rc != BPSEC_SUCCESS) goto out;
+    if (policy_uses_bcb(&new_policy)) {
+        rc = init_aes_gcm_ctx_into(new_policy.bcb_context, new_bcb_key_ref, &new_aes_ctx);
+        if (rc != BPSEC_SUCCESS) goto fail;
     }
 
-    s->cached_key_expiry_ms = 0;
+    uint64_t new_expiry_ms = 0;
     const bp_key_provider_t *kp = bpsdk_get_key_provider();
     if (kp && kp->get_key_expiry) {
         uint64_t exp = 0;
-        if (policy_uses_bcb(policy)
-            && kp->get_key_expiry(kp->provider_ctx, s->bcb_key_ref, &exp) == 0
+        if (policy_uses_bcb(&new_policy)
+            && kp->get_key_expiry(kp->provider_ctx, new_bcb_key_ref, &exp) == 0
             && exp > 0) {
-            s->cached_key_expiry_ms = exp;
+            new_expiry_ms = exp;
         }
-        if (policy_uses_bib(policy)
-            && kp->get_key_expiry(kp->provider_ctx, s->bib_key_ref, &exp) == 0
+        if (policy_uses_bib(&new_policy)
+            && kp->get_key_expiry(kp->provider_ctx, new_bib_key_ref, &exp) == 0
             && exp > 0
-            && (s->cached_key_expiry_ms == 0 || exp < s->cached_key_expiry_ms)) {
-            s->cached_key_expiry_ms = exp;
+            && (new_expiry_ms == 0 || exp < new_expiry_ms)) {
+            new_expiry_ms = exp;
         }
     }
-
-    if (s->cached_key_expiry_ms > 0
-        && s->cached_key_expiry_ms <= now_dtn_ms()) {
+    if (new_expiry_ms > 0 && new_expiry_ms <= now_dtn_ms()) {
         rc = BPSEC_ERR_KEY_EXPIRED;
-        goto out;
+        goto fail;
     }
 
-    if (s->iv_state_set) {
-        uint8_t persisted_salt[BPSEC_IV_SALT_LEN];
-        uint64_t persisted_counter = 0;
-        memset(persisted_salt, 0, sizeof(persisted_salt));
-        if (s->iv_state.load(s->iv_state.ctx, s->name,
-                             persisted_salt, &persisted_counter) == 0) {
-            int empty = 1;
-            for (size_t i = 0; i < sizeof(persisted_salt); i++) {
-                if (persisted_salt[i]) { empty = 0; break; }
-            }
-            if (!empty) memcpy(s->iv_salt, persisted_salt, sizeof(persisted_salt));
-            s->iv_counter = (uint32_t)persisted_counter;
-        }
+    mutex_lock(&s->mutex);
+
+    uint8_t  iv_salt_after[BPSEC_IV_SALT_LEN];
+    uint32_t iv_counter_after = 0;
+    int      iv_applied = 0;
+    rc = resolve_iv_state(s, iv_salt_after, &iv_counter_after, &iv_applied);
+    if (rc != BPSEC_SUCCESS) {
+        mutex_unlock(&s->mutex);
+        goto fail;
     }
 
+    void *old_hmac_ctx = s->hmac_ctx;
+    void *old_aes_ctx  = s->aes_gcm_ctx;
+
+    memcpy(s->bib_key_ref, new_bib_key_ref, sizeof(s->bib_key_ref));
+    memcpy(s->bcb_key_ref, new_bcb_key_ref, sizeof(s->bcb_key_ref));
+    s->policy = new_policy;
+    if (s->policy.bib_key_ref) s->policy.bib_key_ref = s->bib_key_ref;
+    if (s->policy.bcb_key_ref) s->policy.bcb_key_ref = s->bcb_key_ref;
+    s->hmac_ctx             = new_hmac_ctx;
+    s->aes_gcm_ctx          = new_aes_ctx;
+    s->cached_key_expiry_ms = new_expiry_ms;
+    if (iv_applied) {
+        memcpy(s->iv_salt, iv_salt_after, sizeof(iv_salt_after));
+        s->iv_counter = iv_counter_after;
+    }
     s->policy_set = 1;
-    rc = BPSEC_SUCCESS;
 
-out:
-    if (rc != BPSEC_SUCCESS) free_cached_ctx_locked(s);
     mutex_unlock(&s->mutex);
+    free_ctx_pair(old_hmac_ctx, old_aes_ctx);
+    return BPSEC_SUCCESS;
+
+fail:
+    free_ctx_pair(new_hmac_ctx, new_aes_ctx);
     return rc;
 }
 
@@ -588,7 +670,7 @@ static int do_secure_encode_locked(bp_session_t *s,
                                    uint8_t **out, size_t *out_len) {
     if (!s->policy_set) return BPSEC_ERR_INVALID_POLICY;
     if (!opts || !opts->dest_eid) return BPSEC_ERR_INVALID_POLICY;
-    if (len > 0 && !data) return BPSEC_ERR_INVALID_POLICY;
+    if (!data || len == 0) return BPSEC_ERR_INVALID_POLICY;
 
     uint32_t lifetime = opts->lifetime_ms ? opts->lifetime_ms : 60000;
     if (s->cached_key_expiry_ms > 0) {
@@ -791,9 +873,15 @@ int bp_session_send(bp_session_t *s,
 
 /*
  * Minimal ASB decoder for the [targets, ctx_id, ctx_flags, source, params,
- * results] layout that build_*_asb() emits. Returns the parameters and
- * the first result tuple; that is all that Phase 1 verification and
- * decryption need.
+ * results] layout that build_*_asb() emits. Phase 1 only accepts a
+ * single payload target and a single result tuple per ASB; multi-target
+ * ASBs and security-source verification are deferred to Step A2 along
+ * with the foreign-stack backends.
+ *
+ * `expect_ctx_id` is the RFC 9173 context id the caller expects (1 for
+ * BIB-HMAC-SHA2, 2 for BCB-AES-GCM); a mismatch is rejected so the
+ * session never tries to decrypt with the wrong primitive. The variant
+ * parameter (SHA / AES) is also validated when present.
  */
 typedef struct {
     int      have_iv;
@@ -808,7 +896,10 @@ typedef struct {
     uint64_t target_block;
 } asb_view_t;
 
-static int decode_asb_view(const uint8_t *data, size_t len, asb_view_t *out) {
+#define BPSEC_RESULT_ID 1
+
+static int decode_asb_view(const uint8_t *data, size_t len,
+                           uint64_t expect_ctx_id, asb_view_t *out) {
     memset(out, 0, sizeof(*out));
     cbor_decoder_t dec;
     cbor_decoder_init(&dec, data, len);
@@ -817,19 +908,18 @@ static int decode_asb_view(const uint8_t *data, size_t len, asb_view_t *out) {
     if (cbor_decode_array(&dec, &arr) < 0 || arr != 6) return -1;
 
     size_t targets;
-    if (cbor_decode_array(&dec, &targets) < 0 || targets < 1) return -1;
+    if (cbor_decode_array(&dec, &targets) < 0 || targets != 1) return -1;
     if (cbor_decode_uint(&dec, &out->target_block) < 0) return -1;
-    for (size_t i = 1; i < targets; i++) {
-        if (cbor_skip(&dec) < 0) return -1;
-    }
 
     uint64_t ctx_id, ctx_flags;
     if (cbor_decode_uint(&dec, &ctx_id) < 0) return -1;
+    if (ctx_id != expect_ctx_id) return -1;
     if (cbor_decode_uint(&dec, &ctx_flags) < 0) return -1;
+    if (ctx_flags != 1) return -1;
 
     if (cbor_skip(&dec) < 0) return -1;
 
-    if (ctx_flags & 1) {
+    {
         size_t param_count;
         if (cbor_decode_array(&dec, &param_count) < 0) return -1;
         for (size_t i = 0; i < param_count; i++) {
@@ -861,13 +951,14 @@ static int decode_asb_view(const uint8_t *data, size_t len, asb_view_t *out) {
     }
 
     size_t result_targets;
-    if (cbor_decode_array(&dec, &result_targets) < 0 || result_targets < 1) return -1;
+    if (cbor_decode_array(&dec, &result_targets) < 0 || result_targets != 1) return -1;
     size_t inner;
-    if (cbor_decode_array(&dec, &inner) < 0 || inner < 1) return -1;
+    if (cbor_decode_array(&dec, &inner) < 0 || inner != 1) return -1;
     size_t pair_len;
     if (cbor_decode_array(&dec, &pair_len) < 0 || pair_len != 2) return -1;
     uint64_t rid;
     if (cbor_decode_uint(&dec, &rid) < 0) return -1;
+    if (rid != BPSEC_RESULT_ID) return -1;
     if (cbor_decode_bytes(&dec, &out->tag, &out->tag_len) < 0) return -1;
     out->have_tag = 1;
     return 0;
@@ -906,17 +997,20 @@ static int do_process_locked(bp_session_t *s,
         if (!policy_uses_bcb(&s->policy)) continue;
 
         asb_view_t view;
-        if (decode_asb_view(b->data, b->data_len, &view) < 0
+        if (decode_asb_view(b->data, b->data_len, 2, &view) < 0
             || view.target_block != BPSEC_PAYLOAD_BLOCK_NUMBER
-            || !view.have_iv || !view.have_tag) {
+            || !view.have_iv || !view.have_tag
+            || !view.have_variant || !view.have_scope
+            || view.tag_len != BP_CRYPTO_AES_GCM_TAG_LEN
+            || view.variant != rfc9173_aes_variant_code(s->policy.bcb_context)
+            || view.scope   != (uint64_t)s->policy.bcb_scope) {
             rc = BPSEC_ERR_DECRYPT; goto done;
         }
 
         const bp_crypto_backend_t *be = bpsdk_get_crypto_backend();
         uint8_t aad_buf[2];
         int aad_len = encode_uint_inline(aad_buf, sizeof(aad_buf),
-                                         view.have_scope ? view.scope
-                                                         : (uint64_t)s->policy.bcb_scope);
+                                         (uint64_t)s->policy.bcb_scope);
         if (aad_len < 0) { rc = BPSEC_ERR_INTERNAL; goto done; }
 
         uint8_t *plaintext = bp_alloc(bundle.payload_len > 0 ? bundle.payload_len : 1);
@@ -946,16 +1040,17 @@ static int do_process_locked(bp_session_t *s,
         if (!policy_uses_bib(&s->policy) && !saw_bcb) continue;
 
         asb_view_t view;
-        if (decode_asb_view(b->data, b->data_len, &view) < 0
+        if (decode_asb_view(b->data, b->data_len, 1, &view) < 0
             || view.target_block != BPSEC_PAYLOAD_BLOCK_NUMBER
-            || !view.have_tag) {
+            || !view.have_tag
+            || !view.have_variant || !view.have_scope
+            || view.variant != rfc9173_sha_variant_code(s->policy.bib_context)
+            || view.scope   != (uint64_t)s->policy.bib_scope) {
             rc = BPSEC_ERR_VERIFY; goto done;
         }
         if (!policy_uses_bib(&s->policy)) continue;
 
-        rc = hmac_verify_locked(s,
-                                view.have_scope ? (bpsec_scope_flags_t)view.scope
-                                                : s->policy.bib_scope,
+        rc = hmac_verify_locked(s, s->policy.bib_scope,
                                 bundle.payload, bundle.payload_len,
                                 view.tag, view.tag_len);
         if (rc != BPSEC_SUCCESS) {
