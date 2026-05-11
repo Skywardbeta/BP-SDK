@@ -5,11 +5,19 @@
  * BP_KEY_USAGE_AES) so that a session asking for an integrity key cannot
  * accidentally pull a confidentiality key (or vice versa). Expired keys
  * are filtered as well, even if the keystore has not yet purged them.
+ *
+ * Time units:
+ *   The provider contract (bp_key_provider_t.get_key_expiry) returns
+ *   DTN milliseconds, matching BPv7 lifetime units used by the session.
+ *   The legacy bpsec_keystore_t API stores expires_at as DTN seconds;
+ *   the keystore-backed wrapper here converts seconds -> ms on read.
+ *   The file-backed provider stores DTN milliseconds as written.
  */
 #include "bp_key_provider.h"
 #include "bp_utils.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +54,10 @@ static int usage_matches(uint8_t entry_type, int requested_usage) {
     if (requested_usage == BP_KEY_USAGE_HMAC) return entry_type == BPSEC_KEY_TYPE_HMAC;
     if (requested_usage == BP_KEY_USAGE_AES)  return entry_type == BPSEC_KEY_TYPE_AES;
     return 0;
+}
+
+static uint64_t now_dtn_ms(void) {
+    return bp_time_now_dtn() * 1000ULL;
 }
 
 static int entry_is_live(const bpsec_key_entry_t *e) {
@@ -90,8 +102,11 @@ static int ks_get_key_expiry(void *pctx, const char *key_ref, uint64_t *expiry_m
     bpsec_keystore_t *ks = pctx;
     bpsec_key_entry_t entry;
     if (bpsec_keystore_get(ks, key_ref, &entry) < 0) return -1;
-    *expiry_ms = entry.expires_at;
+    uint64_t secs = entry.expires_at;
     memset(&entry, 0, sizeof(entry));
+    if (secs == 0) { *expiry_ms = 0; return 0; }
+    if (secs > UINT64_MAX / 1000ULL) { *expiry_ms = UINT64_MAX; return 0; }
+    *expiry_ms = secs * 1000ULL;
     return 0;
 }
 
@@ -157,11 +172,22 @@ static char *trim_inplace(char *s) {
     return s;
 }
 
-static uint8_t guess_type_from_len(size_t len) {
-    if (len == 16 || len == 24 || len == 32) return BPSEC_KEY_TYPE_AES;
-    return BPSEC_KEY_TYPE_HMAC;
+static int parse_key_type(const char *tok, uint8_t *out) {
+    if (!tok) return -1;
+    if (strcmp(tok, "hmac") == 0) { *out = BPSEC_KEY_TYPE_HMAC; return 0; }
+    if (strcmp(tok, "aes")  == 0) { *out = BPSEC_KEY_TYPE_AES;  return 0; }
+    return -1;
 }
 
+/*
+ * File format (one key per line):
+ *
+ *     <key_id> <type> <hex_bytes> [<expiry_dtn_ms>]
+ *
+ * `type` is the literal token `hmac` or `aes`. Length-based guessing
+ * was removed because it misclassifies common 32-byte HMAC-SHA-256 keys
+ * as AES. Lines beginning with '#' and blank lines are ignored.
+ */
 bp_key_provider_file_t *bp_key_provider_file_create(const char *path) {
     if (!path) return NULL;
     FILE *fp = fopen(path, "r");
@@ -172,21 +198,46 @@ bp_key_provider_file_t *bp_key_provider_file_create(const char *path) {
     memset(p, 0, sizeof(*p));
 
     char line[1024];
+    int line_no = 0;
     while (fgets(line, sizeof(line), fp)) {
+        line_no++;
         char *t = trim_inplace(line);
         if (*t == '\0' || *t == '#') continue;
         char id[BPSEC_KEY_MAX_ID_LEN];
+        char type_tok[8];
         char hex[BP_KEY_PROVIDER_MAX_KEY_LEN * 2 + 1];
         unsigned long long expiry = 0;
-        int n = sscanf(t, "%63s %256s %llu", id, hex, &expiry);
-        if (n < 2) continue;
-        if (p->count >= p->capacity && file_keys_grow(p) < 0) goto fail;
+        int n = sscanf(t, "%63s %7s %256s %llu", id, type_tok, hex, &expiry);
+        if (n < 3) {
+            bp_log(BP_LOG_WARN, "key provider %s:%d: malformed line", path, line_no);
+            continue;
+        }
+        uint8_t key_type;
+        if (parse_key_type(type_tok, &key_type) < 0) {
+            bp_log(BP_LOG_WARN,
+                   "key provider %s:%d: unknown type '%s' (expected hmac or aes)",
+                   path, line_no, type_tok);
+            continue;
+        }
+        uint8_t bytes[BP_KEY_PROVIDER_MAX_KEY_LEN];
+        size_t bytes_len = 0;
+        if (hex_decode(hex, bytes, sizeof(bytes), &bytes_len) < 0) {
+            bp_log(BP_LOG_WARN, "key provider %s:%d: invalid hex", path, line_no);
+            memset(bytes, 0, sizeof(bytes));
+            continue;
+        }
+        if (p->count >= p->capacity && file_keys_grow(p) < 0) {
+            memset(bytes, 0, sizeof(bytes));
+            goto fail;
+        }
         file_key_t *k = &p->keys[p->count];
         memset(k, 0, sizeof(*k));
-        if (hex_decode(hex, k->data, sizeof(k->data), &k->data_len) < 0) continue;
+        memcpy(k->data, bytes, bytes_len);
+        k->data_len = bytes_len;
+        memset(bytes, 0, sizeof(bytes));
         k->id = bp_strdup(id);
         if (!k->id) { memset(k->data, 0, sizeof(k->data)); goto fail; }
-        k->type = guess_type_from_len(k->data_len);
+        k->type = key_type;
         k->expires_at = (uint64_t)expiry;
         p->count++;
     }
@@ -221,7 +272,7 @@ static const file_key_t *file_lookup(const bp_key_provider_file_t *p,
 }
 
 static int file_key_live(const file_key_t *k) {
-    return k->expires_at == 0 || k->expires_at > bp_time_now_dtn();
+    return k->expires_at == 0 || k->expires_at > now_dtn_ms();
 }
 
 static int file_get_key(void *pctx, const char *key_ref, int usage,

@@ -33,6 +33,21 @@ extern "C" {
 #define BP_CRYPTO_HMAC_SHA384_LEN 48
 #define BP_CRYPTO_HMAC_SHA512_LEN 64
 
+/*
+ * Lifecycle contract for the HMAC ctx returned by hmac_init():
+ *
+ *   - The ctx is created once per session and reused across many
+ *     hmac_update / hmac_final cycles (one cycle per outbound bundle).
+ *   - hmac_final MUST leave the ctx ready for the next cycle of
+ *     hmac_update calls without an intervening re-init. Implementations
+ *     that wrap a one-shot HMAC API should buffer in update and reset
+ *     the buffer in final; implementations that wrap a streaming HMAC
+ *     should call the underlying reset/restart in final.
+ *
+ * The same applies to the AES-GCM ctx: hmac_init / aes_gcm_init are
+ * called once and the corresponding free is called once at session
+ * close; encrypt / decrypt / final on the same ctx must be reusable.
+ */
 typedef struct {
     int  (*hmac_init)(void *backend_ctx, const uint8_t *key, size_t key_len,
                       int hash_variant, void **out_ctx);
@@ -66,6 +81,13 @@ typedef struct {
  * stack-allocated value. The eight function pointers are required; this
  * call returns a negative value if any of them is NULL. Pass NULL to
  * revert to the in-tree default backend.
+ *
+ * NOTE: register the backend BEFORE the first bp_session_open() and keep
+ * the same backend installed for the lifetime of every open session.
+ * Sessions resolve the active backend on every send / recv / close, so a
+ * runtime swap while sessions are live can leave them holding a ctx
+ * created by one backend that is then freed by another. Per-session
+ * backend snapshots are deferred to a later phase.
  */
 int bpsdk_register_crypto_backend(const bp_crypto_backend_t *backend);
 

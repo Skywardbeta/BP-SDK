@@ -7,8 +7,11 @@
  * KMS adapters, etc.).
  *
  * Two reference providers are shipped:
- *   - keystore: thin wrapper over the in-process bpsec_keystore_t
- *   - file:     loads `<key_id> <hex_bytes> [<expiry_dtn_ms>]` lines
+ *   - keystore: thin wrapper over the in-process bpsec_keystore_t.
+ *   - file:     loads `<key_id> <hmac|aes> <hex_bytes> [<expiry_dtn_ms>]`
+ *               lines from a UTF-8 text file. The type token is required;
+ *               there is no length-based heuristic. Lines beginning with
+ *               '#' and blank lines are ignored.
  */
 #ifndef BP_KEY_PROVIDER_H
 #define BP_KEY_PROVIDER_H
@@ -35,12 +38,28 @@ typedef struct {
 
     int (*key_available)(void *provider_ctx, const char *key_ref, int usage);
 
+    /*
+     * Report key expiry in DTN milliseconds since the BPv7 epoch, or 0
+     * if the key never expires. Used by the session to compare against
+     * the bundle's lifetime.
+     */
     int (*get_key_expiry)(void *provider_ctx,
                           const char *key_ref, uint64_t *expiry_ms);
 
     void *provider_ctx;
 } bp_key_provider_t;
 
+/*
+ * Install a provider globally. The struct is copied; the caller may pass
+ * a stack-allocated value. Pass NULL to revert to the default keystore-
+ * backed provider.
+ *
+ * NOTE: register the provider BEFORE the first bp_session_open() and
+ * keep the same provider installed for the lifetime of every open
+ * session. Sessions resolve the active provider lazily, so a runtime
+ * swap while sessions are live can break key resolution mid-flight.
+ * Per-session provider snapshots are deferred to a later phase.
+ */
 int bpsdk_register_key_provider(const bp_key_provider_t *provider);
 
 const bp_key_provider_t *bpsdk_get_key_provider(void);
