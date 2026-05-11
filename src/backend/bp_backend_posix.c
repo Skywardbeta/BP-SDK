@@ -279,9 +279,14 @@ static int posix_bundle_free(bp_bundle_t *bundle) {
     return BP_SUCCESS;
 }
 
+/*
+ * Block up to timeout_ms for either a new TCPCL connection (via select()
+ * on the listen socket) or the next bundle on an established session
+ * (via SO_RCVTIMEO). A negative timeout_ms means "block forever",
+ * matching the convention used by bp_recv_raw().
+ */
 static int posix_receive_raw(const char *local_eid, uint8_t **wire,
                              size_t *wire_len, int timeout_ms) {
-    (void)timeout_ms;
     if (!wire || !wire_len) return BP_ERROR_INVALID_ARGS;
     *wire = NULL;
     *wire_len = 0;
@@ -300,16 +305,56 @@ static int posix_receive_raw(const char *local_eid, uint8_t **wire,
             listen(g_listen_fd, 1);
             strncpy(g_local_node, local_eid, sizeof(g_local_node) - 1);
         }
+
+        if (timeout_ms >= 0) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(g_listen_fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec  = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            int sr = select(g_listen_fd + 1, &rfds, NULL, NULL, &tv);
+            if (sr == 0) return BP_ERROR_TIMEOUT;
+            if (sr < 0)  return BP_ERROR_PROTOCOL;
+        }
+
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
         int client_fd = accept(g_listen_fd, (struct sockaddr*)&peer, &peer_len);
         if (client_fd < 0) return BP_ERROR_TIMEOUT;
+
+        if (timeout_ms >= 0) {
+#ifdef _WIN32
+            DWORD tv_ms = (DWORD)timeout_ms;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char*)&tv_ms, sizeof(tv_ms));
+#else
+            struct timeval rcv_tv;
+            rcv_tv.tv_sec  = timeout_ms / 1000;
+            rcv_tv.tv_usec = (timeout_ms % 1000) * 1000;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                       &rcv_tv, sizeof(rcv_tv));
+#endif
+        }
+
         tcpcl_session_init(&g_session, client_fd);
         tcpcl_recv_contact_header(client_fd);
         tcpcl_send_contact_header(client_fd);
         tcpcl_recv_sess_init(&g_session);
         tcpcl_send_sess_init(&g_session);
         g_session.connected = 1;
+    } else if (timeout_ms >= 0) {
+#ifdef _WIN32
+        DWORD tv_ms = (DWORD)timeout_ms;
+        setsockopt(g_session.fd, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char*)&tv_ms, sizeof(tv_ms));
+#else
+        struct timeval rcv_tv;
+        rcv_tv.tv_sec  = timeout_ms / 1000;
+        rcv_tv.tv_usec = (timeout_ms % 1000) * 1000;
+        setsockopt(g_session.fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &rcv_tv, sizeof(rcv_tv));
+#endif
     }
 
     uint8_t *buf = NULL;
