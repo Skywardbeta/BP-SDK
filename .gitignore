@@ -1,23 +1,21 @@
-/.agent
-
 # Build outputs
-c/build/
+build/
 *.o
 *.a
 *.exe
 *.lib
 *.dll
 
-# Local dev scripts (use Makefile for production)
-c/build.bat
-
-# IDE
+# Editor / IDE
 .vscode/
 .idea/
 *.swp
 *~
+.agent/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Roadmap doc kept out of public history
 /dev.md

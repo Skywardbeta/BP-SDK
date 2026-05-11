@@ -1,269 +1,174 @@
-# Bundle Protocol SDK (BP-SDK)
+# BP-SDK
 
-Clean, modern protoype API for BP implementation, available in both C and Rust.
+A C SDK for **DTN Bundle Protocol v7 (RFC 9171)** with a declarative
+**BPSec (RFC 9172 / 9173)** runtime control layer.
 
-## Overview
+BP-SDK plays the role of strongSwan's `vici` / `swanctl` for BPSec:
+applications declare security intent through a session API and the SDK
+takes care of policy installation, crypto-context reuse, IV management,
+and key expiry enforcement. Key management protocols (DTKA, BERMUDA,
+SAFE, BPSec-MLS, KMS adapters) are out of scope and are integrated
+through the pluggable `bp_key_provider_t` contract.
 
-BP-SDK provides high-level interfaces to DTNs
+> Status: **Phase 1 prototype** — payload-only BIB-HMAC-SHA-256 /
+> BCB-AES-GCM-256 against the in-tree POSIX TCPCL backend.
 
-- **C API**: Wrapper over ION-DTN, uD3tn, HDTN with automated memory management
-- **Rust API**: Type-safe, async interface with zero-copy operations
-- **Cross-Compatible**: Both APIs work with the same ION-DTN installation
-- **Thread-Safe**: Safe concurrent operations in both languages
+## Repository Layout
 
-## Installation
-ION-DTN as example
+```
+include/      Public headers
+src/          Library sources
+  backend/    Pluggable backends (POSIX TCPCL, Linux AF_BP)
+tests/        Unit + integration tests
+examples/     Minimal sample programs
+Makefile      Cross-platform build (Linux / macOS / MinGW)
+build.bat     Windows convenience wrapper
+```
 
-### Prerequisites
+## Building
 
-1. **ION-DTN Installation** (Required for both C and Rust)
-   ```bash
-   # Install ION-DTN
-   cd /path/to/ION-DTN
-   ./configure && make && sudo make install
-   ```
+### Linux / macOS
 
-2. **For C Development**
-   ```bash
-   cd BP-SDKS
-   make
-   sudo make install
-   ```
+```bash
+make            # builds libbp_sdk.a, tests, examples
+make test       # runs the test suite
+```
 
-3. **For Rust Development**
-   ```bash
-   # Install Rust (1.70+)
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   
-   # Add to Cargo.toml
-   [dependencies]
-   bp-sdk = { path = "path/to/BP-SDKS/rust" }
-   tokio = { version = "1.0", features = ["full"] }
-   ```
+### Windows (MinGW-w64)
 
-## Quick Start
+```bat
+build.bat
+```
 
-### C API
+Either path produces `build/libbp_sdk.a` plus the test and example
+binaries under `build/`.
+
+## Quick Start — Plain Send / Receive
 
 ```c
 #include "bp_sdk.h"
+#include <stdio.h>
 
-int main() {
-    bp_init("ipn:1.1", NULL);
-    
-    bp_send("ipn:1.1", "ipn:2.1", "Hello", 5, 
+int main(void) {
+    bp_init("ipn:1.0", NULL);
+
+    bp_send("ipn:1.1", "ipn:2.1",
+            "Hello, DTN", 10,
             BP_PRIORITY_STANDARD, BP_CUSTODY_NONE, 3600, NULL);
-    
-    bp_endpoint_t *endpoint;
-    bp_endpoint_create("ipn:2.1", &endpoint);
-    bp_endpoint_register(endpoint);
-    
+
+    bp_endpoint_t *ep;
+    bp_endpoint_create("ipn:2.1", &ep);
+
     bp_bundle_t *bundle;
-    if (bp_receive(endpoint, &bundle, 5000) == BP_SUCCESS) {
-        printf("Received: %.*s\n", (int)bundle->payload_len, (char*)bundle->payload);
+    if (bp_receive(ep, &bundle, 5000) == BP_SUCCESS) {
+        printf("got %.*s\n", (int)bundle->payload_len,
+               (char *)bundle->payload);
         bp_bundle_free(bundle);
     }
-    
-    bp_endpoint_unregister(endpoint);
-    bp_endpoint_destroy(endpoint);
+
+    bp_endpoint_destroy(ep);
     bp_shutdown();
     return 0;
 }
 ```
 
-### Rust API
+## Quick Start — BPSec Session
 
-```rust
-use bp_sdk::prelude::*;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    let sdk = BpSdk::new(Eid::new("ipn:1.1")?, None)?;
-    sdk.init().await?;
-    
-
-    let endpoint = sdk.create_endpoint(Eid::new("ipn:1.1")?).await?;
-    
-
-    let bundle = Bundle::new(
-        Eid::new("ipn:1.1")?,
-        Eid::new("ipn:2.1")?,
-        "Hello from Rust!"
-    );
-    sdk.send(bundle).await?;
-    
-
-    match endpoint.receive(Some(Duration::from_secs(10))).await {
-        Ok(bundle) => {
-            println!("Received: {}", 
-                String::from_utf8_lossy(&bundle.payload));
-        }
-        Err(BpError::Timeout) => println!("No bundles received"),
-        Err(e) => eprintln!("Error: {}", e),
-    }
-    
-    sdk.shutdown().await?;
-    Ok(())
-}
-```
-
-## Key Features
-
-### C API Features
-- **Memory Management**: Automatic cleanup of bundles and endpoints
-- **Error Handling**: Clear error codes with descriptive messages
-- **Thread Safety**: Safe for multi-threaded applications
-- **ION Integration**: Direct compatibility with existing ION setups
-
-### Rust API Features  
-- **Type Safety**: Compile-time validation of EIDs and configurations
-- **Async/Await**: Non-blocking operations with tokio
-- **Zero-Copy**: Efficient payload handling with `Bytes`
-- **Memory Safety**: No buffer overflows or memory leaks
-
-## Examples
-
-### Build and Run C Examples
-```bash
-# Build examples
-make examples
-
-./build/simple_send ipn:1.1 ipn:2.1 "Hello, DTN!"
-./build/simple_receive ipn:2.1
-```
-
-### Run Rust Examples
-```bash
-cargo run --example simple_send
-cargo run --example simple_receive
-```
-
-## Custom Convergence Layer Adapters
-
-### C Implementation
 ```c
-int my_send(const void *data, size_t len, const char *dest, void *ctx) {
-    return send_via_my_protocol(data, len, dest);
-}
+#include "bp_sdk.h"
+#include "bp_session.h"
+#include "bp_key_provider.h"
+#include "bp_bpsec_keys.h"
 
-int my_receive(void *data, size_t len, char *source, void *ctx) {
-    return receive_via_my_protocol(data, len, source);
-}
+int main(void) {
+    bp_init("ipn:1.0", NULL);
 
-bp_cla_t *cla = malloc(sizeof(bp_cla_t));
-cla->protocol_name = strdup("my_protocol");
-cla->send_callback = my_send;
-cla->receive_callback = my_receive;
-bp_cla_register(cla);
-```
+    uint8_t key[32] = { /* 32 bytes from your KMS / file / DTKA */ };
+    bpsec_keystore_add(bpsdk_default_keystore(),
+                       "k1", BPSEC_KEY_TYPE_AES,
+                       key, sizeof(key), NULL, 0);
 
-### Rust Implementation
-```rust
-use bp_sdk::ClaManager;
+    bp_session_t *s = bp_session_open("uplink");
+    bp_session_set_source(s, "ipn:1.1");
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ClaManager::new();
-    let udp_cla = manager.create_udp_cla("0.0.0.0:4556").await?;
-    
-    udp_cla.set_receive_callback(Arc::new(|data, source_addr| {
-        println!("Received {} bytes from {}", data.len(), source_addr);
-    }));
-    
-    udp_cla.start().await?;
-    Ok(())
-}
-```
+    bp_security_policy_t policy = {
+        .mode        = BPSEC_MODE_BCB_ONLY,
+        .bcb_context = BPSEC_CTX_AES_GCM_256,
+        .bcb_targets = BPSEC_TARGET_PAYLOAD,
+        .bcb_scope   = BPSEC_SCOPE_BTSD_ONLY,
+        .bcb_key_ref = "k1",
+    };
+    bp_session_set_security(s, &policy);
 
-## Testing
+    bp_delivery_opts_t opts = {
+        .dest_eid    = "ipn:2.1",
+        .lifetime_ms = 60000,
+    };
+    bp_session_send(s, (uint8_t *)"hello", 5, &opts);
 
-### C Tests
-```bash
-
-make test
-./build/test_runner
-```
-
-### Rust Tests
-```bash
-
-cd rust/
-cargo test
-
-
-cargo test test_eid_validation
-cargo test --test integration
-```
-
-## Error Handling
-
-### C Error Handling
-```c
-int result = bp_send(...);
-if (result != BP_SUCCESS) {
-    printf("Error: %s\n", bp_strerror(result));
-}
-```
-
-### Rust Error Handling
-```rust
-match sdk.send(bundle).await {
-    Ok(()) => println!("Success"),
-    Err(BpError::Timeout) => println!("Timeout"),
-    Err(e) => eprintln!("Error: {}", e),
+    bp_session_close(s);
+    bp_shutdown();
 }
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────┐
-│        Applications             │
-├─────────────────────────────────┤
-│    C API        │   Rust API    │
-│  (bp_sdk.h)     │  (bp-sdk)     │
-├─────────────────────────────────┤
-│           ION-DTN Core          │
-│      (NASA Flight Software)     │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│             Application                      │
+└──────────────┬───────────────────────────────┘
+               │ bp_send / bp_session_send / bp_receive
+┌──────────────▼───────────────────────────────┐
+│  Public API (bp_sdk.h, bp_session.h)         │
+├──────────────────────────────────────────────┤
+│  Bundle Core    │  SecurityService           │
+│  bp_bundle      │  bp_session                │
+│  bp_cbor        │  bp_bpsec  bp_bpsec_keys   │
+│  bp_fragment    │  bp_bpsec_policy           │
+│  bp_admin       │                            │
+├─────────────────┴─────┬──────────────────────┤
+│  Backend abstraction  │  Plugin Container    │
+│  bp_backend           │  bp_key_provider     │
+│  └ POSIX TCPCL        │  bp_crypto_backend   │
+│  └ AF_BP socket       │                      │
+└───────────────────────┴──────────────────────┘
 ```
 
-## Administrative Functions
+### SecurityService Highlights
 
-### C Administrative API
+- **Declarative policy** — `mode / context / targets / scope / key_ref`
+  declared once per session.
+- **Cached crypto contexts** — HMAC and AES-GCM key schedules are
+  expanded on `bp_session_set_security()` and reused for every send.
+- **Thread-safe sends** — every `bp_session_*` call serialises on the
+  session mutex; concurrent sends across sessions run in parallel.
+- **IV uniqueness** — 8-byte CSPRNG salt + 4-byte atomic counter, with
+  optional `bp_iv_state_provider_t` for cross-restart persistence.
+- **Key expiry / TTL** — bundle lifetime is rejected if it would
+  outlive the configured key (`BPSEC_ERR_KEY_TTL_MISMATCH`).
+- **Key plugin** — `bp_key_provider_t` lets BERMUDA / DTKA / file / KMS
+  plug in without forking the SDK. Keystore-backed and text-file
+  reference providers are shipped in-tree.
+- **Crypto backend plugin** — `bp_crypto_backend_t` lets you swap the
+  in-tree HMAC / AES-GCM for OpenSSL, libsodium, or hardware acceleration.
+
+## Pluggable Backends
+
+The Bundle layer is reached through `bp_backend_t`:
+
 ```c
-bp_admin_add_plan("ipn:2.0", 1000000);
-time_t start = time(NULL);
-bp_admin_add_contact("ipn:2.1", start, start + 3600, 1000000);
-
-bp_admin_add_range("ipn:2.1", start, start + 3600, 5);
+extern bp_backend_t g_posix_backend;     /* TCPCL over POSIX sockets */
+extern bp_backend_t g_bpsocket_backend;  /* Linux AF_BP socket (kernel module) */
 ```
 
-### Rust Administrative API
-```rust
-// Administrative functions available through ION integration
-sdk.admin().add_plan("ipn:2.0", 1000000).await?;
-sdk.admin().add_contact("ipn:2.1", start, duration, 1000000).await?;
-```
+Selecting a backend is a string match in `bp_init()`'s config argument
+(default: POSIX). Adding a new backend means filling in a `bp_backend_t`
+and exposing it as a global.
 
 ## Compatibility
 
-- **ION-DTN**: 4.0+ 
-- **C Standard**: C99+
-- **Rust**: 1.70+
-- **Platforms**: Linux, macOS
-- **Architecture**: x86_64, ARM64
-
-## Contributing
-
-1. Ensure ION-DTN is installed
-2. For C: Run `make && make test`
-3. For Rust: Run `cargo test`
-4. Follow existing code patterns
-5. Add tests for new functionality
-
-## License
-
-Extends NASA's ION-DTN. See ION-DTN license for terms. 
+- **C standard:** C11
+- **Platforms:** Linux, macOS, Windows (MinGW-w64)
+- **Architectures:** x86_64, ARM64
+- **BPv7:** RFC 9171
+- **BPSec:** RFC 9172 + RFC 9173 default contexts
