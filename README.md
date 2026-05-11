@@ -3,12 +3,19 @@
 A C SDK for **DTN Bundle Protocol v7 (RFC 9171)** with a declarative
 **BPSec (RFC 9172 / 9173)** runtime control layer.
 
-BP-SDK plays the role of strongSwan's `vici` / `swanctl` for BPSec:
-applications declare security intent through a session API and the SDK
-takes care of policy installation, crypto-context reuse, IV management,
-and key expiry enforcement. Key management protocols (DTKA, BERMUDA,
-SAFE, BPSec-MLS, KMS adapters) are out of scope and are integrated
-through the pluggable `bp_key_provider_t` contract.
+For engineers coming from IP networking: BPSec is the bundle-layer
+analogue of IPsec. Where IPsec offers per-packet AH / ESP integrity
+and confidentiality services driven by SPD/SAD, BPSec offers
+per-block BIB / BCB services driven by a security policy engine.
+What's missing in the BP world is the runtime control layer that
+IPsec stacks expose to applications — a place to declare intent
+("protect this flow with these algorithms and these keys") and let
+the engine handle policy installation, crypto-context reuse, IV
+management, and key expiry. BP-SDK fills that gap for BPSec.
+
+Key management protocols (DTKA, BERMUDA, SAFE, BPSec-MLS, KMS
+adapters) are out of scope and are integrated through the pluggable
+`bp_key_provider_t` contract.
 
 > Status: **Phase 1 prototype** — payload-only BIB-HMAC-SHA-256 /
 > BCB-AES-GCM-256 against the in-tree POSIX TCPCL backend.
@@ -16,13 +23,15 @@ through the pluggable `bp_key_provider_t` contract.
 ## Repository Layout
 
 ```
-include/      Public headers
-src/          Library sources
-  backend/    Pluggable backends (POSIX TCPCL, Linux AF_BP)
-tests/        Unit + integration tests
-examples/     Minimal sample programs
-Makefile      Cross-platform build (Linux / macOS / MinGW)
-build.bat     Windows convenience wrapper
+.
+├── include/         Public headers
+├── src/             Library sources
+│   └── backend/     Pluggable backends (POSIX TCPCL, Linux AF_BP)
+├── tests/           Unit and integration tests
+├── examples/        Minimal sample programs
+├── Makefile         Cross-platform build (Linux / macOS / MinGW)
+├── build.bat        Windows convenience wrapper
+└── README.md
 ```
 
 ## Building
