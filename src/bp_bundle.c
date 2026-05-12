@@ -237,7 +237,14 @@ int bp_bundle_decode(const uint8_t *data, size_t len, bp_bundle_full_t *bundle) 
     size_t prim_len;
     if (cbor_decode_array(&dec, &prim_len) < 0) return -1;
 
-    uint64_t tmp;
+    /* All resources cleaned up via the `fail:` label must be declared and
+     * initialised before any `goto fail`, otherwise the cleanup reads
+     * indeterminate values. */
+    bp_block_t *blocks = NULL;
+    size_t      block_cap = 0;
+    size_t      block_cnt = 0;
+    uint64_t    tmp;
+
     if (cbor_decode_uint(&dec, &tmp) < 0) return -1;
     bundle->primary.version = (uint8_t)tmp;
 
@@ -265,10 +272,6 @@ int bp_bundle_decode(const uint8_t *data, size_t len, bp_bundle_full_t *bundle) 
     if (bundle->primary.crc_type != BP_CRC_NONE) {
         if (cbor_skip(&dec) < 0 || dec.error) goto fail;
     }
-
-    /* Decode blocks until break */
-    bp_block_t *blocks = NULL;
-    size_t block_cap = 0, block_cnt = 0;
 
     while (dec.pos < dec.len && dec.buf[dec.pos] != CBOR_BREAK) {
         size_t blk_len;
