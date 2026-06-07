@@ -1,5 +1,7 @@
 # BP-SDK
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A C SDK for **DTN Bundle Protocol v7 (RFC 9171)** with a declarative
 **BPSec (RFC 9172 / 9173)** runtime control layer.
 
