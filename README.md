@@ -19,8 +19,16 @@ Key management protocols (DTKA, BERMUDA, SAFE, BPSec-MLS, KMS
 adapters) are out of scope and are integrated through the pluggable
 `bp_key_provider_t` contract.
 
-> Status: **Phase 1 prototype** — payload-only BIB-HMAC-SHA-256 /
-> BCB-AES-GCM-256 against the in-tree POSIX TCPCL backend.
+> Status: **Core scope complete.** The declarative BPSec runtime control
+> layer is implemented and verified end-to-end: the intent / policy session
+> API, the IV / key-expiry / crypto-context machinery, and the cross-stack
+> adapter layer (ION `bpsecadmin` lowering + uD3TN AAP) all work over the
+> in-tree POSIX TCPCL backend. Payload-target BIB-HMAC-SHA-256 and
+> BCB-AES-GCM-256 are the supported RFC 9173 defaults. What remains is
+> small configuration surface rather than core function — non-default
+> contexts / variants (SHA-384/512, AES-128, COSE), additional target /
+> scope options, and richer native-config knobs — layered onto the same
+> API without reworking it.
 
 ## Repository Layout
 
@@ -31,13 +39,13 @@ module directory plus `include/bp_sdk` is on the include path, so
 
 ```
 .
-├── include/bp_sdk/  Public API: bp_sdk, bp_session, bp_utils, bp_adapter,
-│                    bp_adapter_ion, bp_adapter_ud3tn, bp_bpsec_keys, bp_key_provider
+├── include/bp_sdk/  Public API: bp_sdk, bp_session, bp_security_intent, bp_utils,
+│                    bp_adapter, bp_adapter_ion, bp_adapter_ud3tn, bp_bpsec_keys, bp_key_provider
 ├── src/
 │   ├── core/        SDK entry, allocator, CBOR (bp_sdk, bp_utils, bp_cbor)
 │   ├── bundle/      Bundle build/parse, fragments, admin records, streaming
 │   ├── transport/   TCPCL, storage, pluggable backends (POSIX, Linux AF_BP)
-│   ├── session/     Session + BPSec policy/session implementation
+│   ├── session/     Session engine + intent-to-policy lowering
 │   ├── bpsec/       BPSec engine, keys, policy store, crypto + key providers
 │   └── adapters/    Adapter Contract + bp_secure_link facade (bp_adapter)
 │       ├── ion/     ION-DTN: bpsecadmin lowering + adapter
@@ -141,6 +149,31 @@ int main(void) {
 }
 ```
 
+## Quick Start — Declarative Security Intent
+
+`bp_security_intent_t` is the recommended high-level surface: declare *what*
+protection you want (integrity, confidentiality, or both) plus a key, and
+BP-SDK fills in the RFC 9173 context and scope with safe defaults. No
+wire-level vocabulary leaks into application code. `bp_security_policy_t`
+remains the advanced interface for non-default contexts or scopes.
+
+```c
+#include "bp_sdk.h"
+#include "bp_security_intent.h"
+
+    bp_security_intent_t intent = {
+        .service = BP_SEC_INTENT_CONFIDENTIAL,  /* what, not how */
+        .target  = BP_SEC_TARGET_PAYLOAD,
+        .key_ref = "k1",
+    };
+    bp_session_set_security_intent(s, &intent);
+```
+
+Lowering defaults: `INTEGRITY` → BIB-HMAC-SHA-256, `CONFIDENTIAL` →
+BCB-AES-GCM-256, `INTEGRITY_AND_CONFIDENTIAL` → BCB-AES-GCM-256 alone (the
+GCM tag carries integrity, RFC 9172 §3.9); scope is BTSD-only. The same
+`bp_secure_link_set_security_intent()` entry exists on the adapter facade.
+
 ## Quick Start — Native BPSec via a Secure Link
 
 The `bp_secure_link` facade lets the **same code** drive a host stack's own
@@ -222,8 +255,10 @@ a convergence layer itself.
 
 ### SecurityService Highlights
 
+- **Declarative intent** — state integrity / confidentiality + a key via
+  `bp_security_intent_t`; RFC 9173 context and scope are filled in for you.
 - **Declarative policy** — `mode / context / targets / scope / key_ref`
-  declared once per session.
+  declared once per session for advanced (non-default) control.
 - **Cached crypto contexts** — HMAC and AES-GCM key schedules are
   expanded on `bp_session_set_security()` and reused for every send.
 - **Thread-safe sends** — every `bp_session_*` call serialises on the
