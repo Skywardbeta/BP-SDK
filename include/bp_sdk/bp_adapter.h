@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include "bp_session.h"
+#include "bp_security_intent.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +68,10 @@ int  bp_secure_link_set_source(bp_secure_link_t *link, const char *source_eid);
 /* Fail-fast: rejected here (before any send) if the policy cannot apply. */
 int  bp_secure_link_set_security(bp_secure_link_t *link,
                                  const bp_security_policy_t *policy);
+
+/* Intent variant: lowers to a default policy, then set_security applies it. */
+int  bp_secure_link_set_security_intent(bp_secure_link_t *link,
+                                        const bp_security_intent_t *intent);
 
 int  bp_secure_link_send(bp_secure_link_t *link, const char *dest_eid,
                          const uint8_t *data, size_t len,

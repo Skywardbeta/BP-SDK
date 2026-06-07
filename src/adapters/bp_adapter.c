@@ -161,6 +161,15 @@ fail:
     return rc;
 }
 
+int bp_secure_link_set_security_intent(bp_secure_link_t *link,
+                                       const bp_security_intent_t *intent) {
+    if (!link || !intent) return BPSEC_ERR_INVALID_POLICY;
+    bp_security_policy_t policy;
+    int rc = bp_security_intent_to_policy(intent, &policy);
+    if (rc != BPSEC_SUCCESS) return rc;
+    return bp_secure_link_set_security(link, &policy);
+}
+
 static int is_registered(const bp_secure_link_t *link, const char *dest) {
     for (size_t i = 0; i < link->registered_count; i++)
         if (strcmp(link->registered[i], dest) == 0) return 1;

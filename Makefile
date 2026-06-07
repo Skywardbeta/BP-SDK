@@ -47,7 +47,7 @@ LIB_SRCS = \
     src/bundle/bp_bundle.c src/bundle/bp_admin.c src/bundle/bp_fragment.c src/bundle/bp_stream.c \
     src/transport/bp_tcpcl.c src/transport/bp_storage.c \
     src/transport/bp_backend_posix.c src/transport/bp_backend_bpsocket.c \
-    src/session/bp_session.c \
+    src/session/bp_session.c src/session/bp_security_intent.c \
     src/bpsec/bp_bpsec.c src/bpsec/bp_bpsec_keys.c src/bpsec/bp_bpsec_policy.c \
     src/bpsec/bp_crypto_backend.c src/bpsec/bp_key_provider.c \
     src/adapters/bp_adapter.c \
@@ -60,14 +60,14 @@ TEST_SRCS = \
     tests/integration/test_phase1.c tests/integration/test_phase2.c \
     tests/integration/test_phase3a.c tests/integration/test_concurrency.c \
     tests/bpsec/test_bpsec_primitives.c \
-    tests/session/test_session.c \
+    tests/session/test_session.c tests/session/test_intent.c \
     tests/adapters/test_facade.c \
     tests/adapters/ion/test_ion_policy.c \
     tests/adapters/ud3tn/test_aap.c \
     tests/adapters/ud3tn/test_ud3tn_adapter.c
 TEST_BINS = $(addprefix $(BUILD)/,$(notdir $(TEST_SRCS:.c=$(EXE))))
 
-EXAMPLES = hello_send sender receiver secure_send secure_link
+EXAMPLES = hello_send sender receiver secure_send secure_intent secure_link
 EXAMPLE_BINS = $(EXAMPLES:%=$(BUILD)/%$(EXE))
 
 vpath %.c $(MODULES) tests/integration tests/bpsec tests/session \
