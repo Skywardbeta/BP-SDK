@@ -2,37 +2,38 @@
 setlocal enabledelayedexpansion
 
 REM Windows convenience build script. The Makefile is the source of truth.
-REM PATH expansion is intentionally kept outside parenthesised IF blocks so
-REM that special characters inside %PATH% (NVIDIA tooling, "Program Files",
-REM unbalanced parens) cannot break command parsing.
+REM Public API headers are in include/bp_sdk/; module sources + private headers
+REM live under src/ (core, bundle, transport, session, bpsec, adapters/{ion,
+REM ud3tn}). All of these are on the include path. PATH expansion is kept
+REM outside parenthesised IF blocks so special characters in %PATH% cannot
+REM break command parsing.
 
 call :ensure_gcc
 if errorlevel 1 goto :error
 
 if not exist build mkdir build
 
-set "CFLAGS=-I./include -Wall -Wextra -std=c11 -O2"
+set "INC=-Iinclude/bp_sdk -Isrc/core -Isrc/bundle -Isrc/transport -Isrc/session -Isrc/bpsec -Isrc/adapters -Isrc/adapters/ion -Isrc/adapters/ud3tn -Itests"
+set "CFLAGS=%INC% -Wall -Wextra -std=c11 -O2"
 set "LDFLAGS=-lws2_32 -lbcrypt"
 
-set "LIB_SRCS=bp_sdk bp_utils bp_cbor bp_bundle bp_tcpcl bp_admin bp_storage bp_fragment bp_stream bp_bpsec bp_bpsec_keys bp_bpsec_policy bp_crypto_backend bp_key_provider bp_session"
-set "BACKEND_SRCS=bp_backend_posix bp_backend_bpsocket"
+set "LIB_SRCS=src\core\bp_sdk src\core\bp_utils src\core\bp_cbor src\bundle\bp_bundle src\bundle\bp_admin src\bundle\bp_fragment src\bundle\bp_stream src\transport\bp_tcpcl src\transport\bp_storage src\transport\bp_backend_posix src\transport\bp_backend_bpsocket src\session\bp_session src\bpsec\bp_bpsec src\bpsec\bp_bpsec_keys src\bpsec\bp_bpsec_policy src\bpsec\bp_crypto_backend src\bpsec\bp_key_provider src\adapters\bp_adapter src\adapters\ion\bp_adapter_ion src\adapters\ion\bp_ion_policy src\adapters\ud3tn\bp_adapter_ud3tn src\adapters\ud3tn\bp_aap"
 
 echo === Compiling library ===
-for %%s in (%LIB_SRCS%) do call :compile "src/%%s.c" "build/%%s.o" || goto :error
-for %%s in (%BACKEND_SRCS%) do call :compile "src/backend/%%s.c" "build/%%s.o" || goto :error
+for %%s in (%LIB_SRCS%) do call :compile "%%s.c" "build\%%~ns.o" || goto :error
 
 echo === Linking library ===
 set "OBJS="
-for %%s in (%LIB_SRCS% %BACKEND_SRCS%) do set "OBJS=!OBJS! build/%%s.o"
+for %%s in (%LIB_SRCS%) do set "OBJS=!OBJS! build/%%~ns.o"
 ar rcs build/libbp_sdk.a %OBJS%
 if errorlevel 1 goto :error
 
-set "TESTS=test_phase1 test_phase2 test_phase3a test_concurrency test_bpsec_primitives test_session"
+set "TESTS=tests\integration\test_phase1 tests\integration\test_phase2 tests\integration\test_phase3a tests\integration\test_concurrency tests\bpsec\test_bpsec_primitives tests\session\test_session tests\adapters\test_facade tests\adapters\ion\test_ion_policy tests\adapters\ud3tn\test_aap tests\adapters\ud3tn\test_ud3tn_adapter"
 echo.
 echo === Building tests ===
-for %%t in (%TESTS%) do call :linkbin "tests/%%t.c" "build/%%t.exe"
+for %%t in (%TESTS%) do call :linkbin "%%t.c" "build\%%~nt.exe"
 
-set "EXAMPLES=hello_send sender receiver secure_send"
+set "EXAMPLES=hello_send sender receiver secure_send secure_link"
 echo.
 echo === Building examples ===
 for %%e in (%EXAMPLES%) do call :linkbin "examples/%%e.c" "build/%%e.exe"

@@ -10,11 +10,22 @@
 #   make debug      - Rebuild with -g -O0 -DDEBUG
 #   make install    - Install lib + headers to PREFIX (default /usr/local)
 #
+# Public API headers live in include/bp_sdk/ (the consumer contract); module
+# sources and their private headers live under src/ (core/ bundle/ transport/
+# session/ bpsec/ and adapters/ with adapters/ion, adapters/ud3tn). Every
+# module dir plus include/bp_sdk are on the include path, so #include "bp_x.h"
+# resolves from anywhere in the tree.
+#
 # Tested on Linux (gcc), macOS (clang), and Windows (MinGW-w64 / MSYS2).
 
 CC      ?= gcc
 AR      ?= ar
-CFLAGS   = -I./include -Wall -Wextra -std=c11 -O2
+
+PUBLIC_INC = include/bp_sdk
+MODULES  = src/core src/bundle src/transport src/session src/bpsec \
+           src/adapters src/adapters/ion src/adapters/ud3tn
+INCLUDES = -I$(PUBLIC_INC) $(addprefix -I,$(MODULES)) -Itests
+CFLAGS   = $(INCLUDES) -Wall -Wextra -std=c11 -O2
 LDFLAGS  =
 
 BUILD    = build
@@ -32,21 +43,35 @@ else
 endif
 
 LIB_SRCS = \
-    bp_sdk.c bp_utils.c bp_cbor.c bp_bundle.c \
-    bp_tcpcl.c bp_admin.c bp_storage.c bp_fragment.c bp_stream.c \
-    bp_bpsec.c bp_bpsec_keys.c bp_bpsec_policy.c \
-    bp_crypto_backend.c bp_key_provider.c bp_session.c
+    src/core/bp_sdk.c src/core/bp_utils.c src/core/bp_cbor.c \
+    src/bundle/bp_bundle.c src/bundle/bp_admin.c src/bundle/bp_fragment.c src/bundle/bp_stream.c \
+    src/transport/bp_tcpcl.c src/transport/bp_storage.c \
+    src/transport/bp_backend_posix.c src/transport/bp_backend_bpsocket.c \
+    src/session/bp_session.c \
+    src/bpsec/bp_bpsec.c src/bpsec/bp_bpsec_keys.c src/bpsec/bp_bpsec_policy.c \
+    src/bpsec/bp_crypto_backend.c src/bpsec/bp_key_provider.c \
+    src/adapters/bp_adapter.c \
+    src/adapters/ion/bp_adapter_ion.c src/adapters/ion/bp_ion_policy.c \
+    src/adapters/ud3tn/bp_adapter_ud3tn.c src/adapters/ud3tn/bp_aap.c
 
-BACKEND_SRCS = bp_backend_posix.c bp_backend_bpsocket.c
+OBJS = $(addprefix $(BUILD)/,$(notdir $(LIB_SRCS:.c=.o)))
 
-OBJS = $(LIB_SRCS:%.c=$(BUILD)/%.o) $(BACKEND_SRCS:%.c=$(BUILD)/%.o)
+TEST_SRCS = \
+    tests/integration/test_phase1.c tests/integration/test_phase2.c \
+    tests/integration/test_phase3a.c tests/integration/test_concurrency.c \
+    tests/bpsec/test_bpsec_primitives.c \
+    tests/session/test_session.c \
+    tests/adapters/test_facade.c \
+    tests/adapters/ion/test_ion_policy.c \
+    tests/adapters/ud3tn/test_aap.c \
+    tests/adapters/ud3tn/test_ud3tn_adapter.c
+TEST_BINS = $(addprefix $(BUILD)/,$(notdir $(TEST_SRCS:.c=$(EXE))))
 
-TESTS = test_phase1 test_phase2 test_phase3a test_concurrency \
-        test_bpsec_primitives test_session
-TEST_BINS = $(TESTS:%=$(BUILD)/%$(EXE))
-
-EXAMPLES = hello_send sender receiver secure_send
+EXAMPLES = hello_send sender receiver secure_send secure_link
 EXAMPLE_BINS = $(EXAMPLES:%=$(BUILD)/%$(EXE))
+
+vpath %.c $(MODULES) tests/integration tests/bpsec tests/session \
+          tests/adapters tests/adapters/ion tests/adapters/ud3tn
 
 .PHONY: all lib tests test examples clean debug install help
 
@@ -60,15 +85,12 @@ $(BUILD):
 $(LIB): $(BUILD) $(OBJS)
 	$(AR) rcs $@ $(OBJS)
 
-$(BUILD)/%.o: src/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/%.o: src/backend/%.c | $(BUILD)
+$(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 tests: lib $(TEST_BINS)
 
-$(BUILD)/test_%$(EXE): tests/test_%.c $(LIB)
+$(BUILD)/test_%$(EXE): test_%.c $(LIB)
 	$(CC) $(CFLAGS) $< -L$(BUILD) -lbp_sdk $(LDFLAGS) -o $@
 
 examples: lib $(EXAMPLE_BINS)
@@ -93,7 +115,7 @@ PREFIX ?= /usr/local
 install: lib
 	install -d $(PREFIX)/lib $(PREFIX)/include/bp_sdk
 	install -m 644 $(LIB) $(PREFIX)/lib/
-	install -m 644 include/*.h $(PREFIX)/include/bp_sdk/
+	install -m 644 $(PUBLIC_INC)/*.h $(PREFIX)/include/bp_sdk/
 
 help:
 	@echo "BP-SDK build targets:"

@@ -22,17 +22,36 @@ adapters) are out of scope and are integrated through the pluggable
 
 ## Repository Layout
 
+Public API headers (the consumer contract) live in `include/bp_sdk/`. Module
+sources and their private headers live under `src/`, grouped by module. Every
+module directory plus `include/bp_sdk` is on the include path, so
+`#include "bp_x.h"` resolves regardless of where the caller lives.
+
 ```
 .
-├── include/         Public headers
-├── src/             Library sources
-│   └── backend/     Pluggable backends (POSIX TCPCL, Linux AF_BP)
-├── tests/           Unit and integration tests
+├── include/bp_sdk/  Public API: bp_sdk, bp_session, bp_utils, bp_adapter,
+│                    bp_adapter_ion, bp_adapter_ud3tn, bp_bpsec_keys, bp_key_provider
+├── src/
+│   ├── core/        SDK entry, allocator, CBOR (bp_sdk, bp_utils, bp_cbor)
+│   ├── bundle/      Bundle build/parse, fragments, admin records, streaming
+│   ├── transport/   TCPCL, storage, pluggable backends (POSIX, Linux AF_BP)
+│   ├── session/     Session + BPSec policy/session implementation
+│   ├── bpsec/       BPSec engine, keys, policy store, crypto + key providers
+│   └── adapters/    Adapter Contract + bp_secure_link facade (bp_adapter)
+│       ├── ion/     ION-DTN: bpsecadmin lowering + adapter
+│       └── ud3tn/   uD3TN: AAP v1 client + adapter
+├── tests/           Mirrors the source modules; shared test_harness.h
+│   ├── integration/ Cross-cutting phase + concurrency suites
+│   ├── bpsec/  session/
+│   └── adapters/    facade, ion/, ud3tn/ (codec + adapter)
 ├── examples/        Minimal sample programs
 ├── Makefile         Cross-platform build (Linux / macOS / MinGW)
 ├── build.bat        Windows convenience wrapper
 └── README.md
 ```
+
+Only headers under `include/bp_sdk/` are part of the stable public surface;
+headers inside `src/` are implementation detail and may change.
 
 ## Building
 
@@ -120,6 +139,58 @@ int main(void) {
 }
 ```
 
+## Quick Start — Native BPSec via a Secure Link
+
+The `bp_secure_link` facade lets the **same code** drive a host stack's own
+BPSec engine. You declare intent + key references once; the adapter either
+lowers the policy onto the stack's native configuration path (ION) or declares
+the intent and relies on the node's existing BPSec configuration (uD3TN), then
+hands data to the Bundle Protocol Agent (BPA), which owns BIB/BCB construction
+and crypto. Switch stacks by changing one string — `"ion"` or `"ud3tn"`.
+
+```c
+#include "bp_adapter.h"
+#include "bp_session.h"
+
+int main(void) {
+    /* "ion"   -> lowers to bpsecadmin rules (.bpsecrc) for ION-DTN
+       "ud3tn" -> registers an endpoint and ships data over AAP */
+    bp_secure_link_t *link = bp_secure_link_open("ion", "rc=node.bpsecrc");
+
+    bp_secure_link_set_source(link, "dtn://sat-1/telemetry");
+
+    bp_security_policy_t policy = {
+        .mode        = BPSEC_MODE_BIB_BCB,
+        .bib_context = BPSEC_CTX_HMAC_SHA2_256, .bib_key_ref = "int-key",
+        .bib_targets = BPSEC_TARGET_PAYLOAD,    .bib_scope = BPSEC_SCOPE_BTSD_ONLY,
+        .bcb_context = BPSEC_CTX_AES_GCM_256,   .bcb_key_ref = "conf-key",
+        .bcb_targets = BPSEC_TARGET_PAYLOAD,    .bcb_scope = BPSEC_SCOPE_BTSD_ONLY,
+    };
+    /* Fail-fast: an unapplicable policy is rejected here, before any send. */
+    bp_secure_link_set_security(link, &policy);
+
+    bp_secure_link_send(link, "dtn://ground/sink",
+                        (const uint8_t *)"telemetry", 9, NULL);
+
+    bp_secure_link_close(link);
+}
+```
+
+The **Adapter Contract** (`bp_adapter.h`) is the invariant behind this: every
+adapter sits above the host BPA and never performs crypto or pushes bundles to
+a convergence layer itself.
+
+- **ION adapter** (`bp_ion_policy.h`) translates the declared intent into
+  `bpsecadmin`-conformant `event_set` + `policyrule` commands (BIB-HMAC-SHA2
+  `sc_id 1`, BCB-AES-GCM   `sc_id 2`) and feeds them to ION's policy engine. BP-SDK's lowering currently
+  emits only `key_name`, so it intentionally supports only ION's default
+  variants (SHA-256, AES-256); other variants are rejected at `set_security`
+  rather than silently downgraded.
+- **uD3TN adapter** (`bp_aap.h`) speaks AAP v1 — connect, register the sub-EID
+  (dtn demux / ipn service number per `ud3tn_aap.md`), send bundle. AAP v1
+  carries no per-flow BPSec policy, so the adapter declares intent and hands
+  data to uD3TN; **BPSec enforcement must already be configured in the node.**
+
 ## Architecture
 
 ```
@@ -140,7 +211,11 @@ int main(void) {
 │  bp_backend           │  bp_key_provider     │
 │  └ POSIX TCPCL        │  bp_crypto_backend   │
 │  └ AF_BP socket       │                      │
-└───────────────────────┴──────────────────────┘
+├───────────────────────┴──────────────────────┤
+│  Adapter Contract (bp_adapter / secure_link)  │
+│  └ ION   adapter  → bpsecadmin rules          │
+│  └ uD3TN adapter  → AAP client                │
+└───────────────────────────────────────────────┘
 ```
 
 ### SecurityService Highlights
