@@ -81,6 +81,44 @@ build.bat
 Either path produces `build/libbp_sdk.a` plus the test and example
 binaries under `build/`.
 
+### DTN stacks for the adapter layer (optional)
+
+The core SDK and the in-tree POSIX TCPCL backend have **no external
+dependency**. You only need a host DTN stack installed if you use the
+`bp_secure_link` adapters, which drive that stack's native BPSec engine:
+ION via `bpsecadmin`, uD3TN via AAP.
+
+**ION-DTN** ([nasa-jpl/ION-DTN](https://github.com/nasa-jpl/ION-DTN)) —
+autotools build; provides `bpadmin`, `bpsecadmin`, etc. Officially
+supported on Linux (Solaris); macOS / FreeBSD / Raspberry Pi OS are
+best-effort.
+
+```bash
+# prerequisites: gcc, make, autoconf, automake, libtool
+git clone https://github.com/nasa-jpl/ION-DTN.git
+cd ION-DTN
+autoreconf -fi
+./configure
+make
+sudo make install
+sudo ldconfig
+```
+
+**uD3TN** ([d3tn/ud3tn](https://gitlab.com/d3tn/ud3tn), AGPLv3) — a lean
+implementation for POSIX and microcontrollers. Clone with submodules
+(bundled mbedTLS / TinyCBOR), then build the POSIX target.
+
+```bash
+# prerequisites: gcc or clang, make, git, python3 (for the AAP tools)
+git clone --recurse-submodules https://gitlab.com/d3tn/ud3tn.git
+cd ud3tn
+make posix                 # binary at build/posix/ud3tn
+make virtualenv            # optional: AAP client tooling (pyd3tn, ud3tn_utils)
+```
+
+Refer to each project's upstream documentation for the authoritative,
+version-specific build steps.
+
 ## Quick Start — Plain Send / Receive
 
 ```c
